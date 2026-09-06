@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //
-//! mycelium-peer — the long-body P2P transport for mycelium (m³).
+//! spore-peer — the long-body P2P transport for Spore (m³).
 //!
 //! A long message never rides a DERO block. The sender holds the ECDH-encrypted
 //! body on their own node and advertises only a pointer (whisper). The recipient
@@ -17,8 +17,8 @@
 //! CBOR-ish payload), BSD-3 and clean-room.
 //!
 //! Usage:
-//!   mycelium-peer serve --listen 0.0.0.0:8099 --dir <body-store-dir>   (sender)
-//!   mycelium-peer fetch --addr host:8099 --cid <64-hex> [--out file]   (recipient)
+//!   spore-peer serve --listen 0.0.0.0:8099 --dir <body-store-dir>   (sender)
+//!   spore-peer fetch --addr host:8099 --cid <64-hex> [--out file]   (recipient)
 //!
 //! Protocol (JSON over the frame):
 //!   request : {"cid": "<64-hex>"}
@@ -42,7 +42,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 fn serve(addr: &str, dir: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    eprintln!("mycelium-peer serve: listening on {addr}, bodies in {dir}");
+    eprintln!("spore-peer serve: listening on {addr}, bodies in {dir}");
     for stream in listener.incoming() {
         match stream {
             Ok(mut s) => {
@@ -128,7 +128,7 @@ fn fetch(addr: &str, cid: &str, out: Option<&str>) -> std::io::Result<()> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: mycelium-peer <serve|fetch> ...");
+        eprintln!("usage: spore-peer <serve|fetch> ...");
         std::process::exit(2);
     }
     match args[1].as_str() {
