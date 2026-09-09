@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  # Push runs only on main: a bare push trigger fires on every commit twice
+  # (push + PR event), which burns private-repo Actions minutes.
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded PR runs (same branch, newer commit) instead of letting
+# stale runs grind to completion.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        # Cargo.lock is tracked; --locked keeps CI on the exact dependency
+        # graph the wire-protocol conformance tests were validated against.
+        run: cargo test --locked
+
+  clippy:
+    name: clippy (warnings non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (--no-deps, report only)
+        continue-on-error: true
+        run: |
+          # CARGO_TERM_COLOR=never: the workflow sets it to 'always', which
+          # injects ANSI escapes between the characters of 'warning:' and
+          # makes the report unparseable. Force plain text so the backlog is
+          # clean and grep-countable. (~20 pre-existing warnings; flip to a
+          # -D warnings gate once the backlog is drained.)
+          CARGO_TERM_COLOR=never cargo clippy --no-deps --message-format=short 2>&1 | tee clippy-report.txt || true
+          warnings=$(grep -cE ':[0-9]+:[0-9]+: warning:' clippy-report.txt || true)
+          crate_summaries=$(grep -aoE 'generated [0-9]+' clippy-report.txt | awk '{s+=$2} END {print s+0}')
+          errors=$(grep -cE '(:[0-9]+:[0-9]+: error|^error:)' clippy-report.txt || true)
+          echo "clippy backlog: ${warnings} diagnostic warnings (${crate_summaries} across crate summaries), ${errors} errors (non-blocking)"
+      - name: Upload clippy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-report
+          path: clippy-report.txt
