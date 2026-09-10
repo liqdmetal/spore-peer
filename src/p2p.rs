@@ -158,9 +158,17 @@ pub fn rpc2_call(
 pub fn decode_message(buf: &[u8]) -> Option<Rpc2Message> {
     let head_v = decode_value(buf)?;
     let obj = head_v.as_object()?;
-    let method = obj.get("M").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let method = obj
+        .get("M")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let seq = obj.get("S").and_then(|v| v.as_u64()).unwrap_or(0);
-    let error = obj.get("E").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let error = obj
+        .get("E")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let used = advance(buf, &head_v);
     let payload = if buf.len() > used {
         decode_value(&buf[used..])?

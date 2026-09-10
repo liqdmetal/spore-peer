@@ -42,8 +42,8 @@ use std::net::{TcpListener, TcpStream};
 mod p2p;
 use p2p::{
     chain_request, chain_response, decode_message, error_response, getobject_request,
-    getobject_response, handshake_request, handshake_response, read_frame, rpc2_call,
-    write_frame, Rpc2Message,
+    getobject_response, handshake_request, handshake_response, read_frame, rpc2_call, write_frame,
+    Rpc2Message,
 };
 
 /// Response status bytes (first byte of every response frame).
@@ -305,16 +305,14 @@ fn sync_stream(s: &mut TcpStream, dir: &str) -> Result<(u64, usize, usize), Stri
     use sha2::{Digest, Sha256};
 
     // 1. handshake: learn the peer's height.
-    let hs = rpc2_call(s, "Peer.Handshake", 1, handshake_request(1))
-        .map_err(|e| e.to_string())?;
+    let hs = rpc2_call(s, "Peer.Handshake", 1, handshake_request(1)).map_err(|e| e.to_string())?;
     if !hs.error.is_empty() {
         return Err(format!("handshake: {}", hs.error));
     }
     let peer_height = hs.payload.get("H").and_then(|v| v.as_u64()).unwrap_or(0);
 
     // 2. chain: newest-first list of [topoheight, blid].
-    let chain = rpc2_call(s, "Peer.Chain", 2, chain_request(0, 5000))
-        .map_err(|e| e.to_string())?;
+    let chain = rpc2_call(s, "Peer.Chain", 2, chain_request(0, 5000)).map_err(|e| e.to_string())?;
     if !chain.error.is_empty() {
         return Err(format!("chain: {}", chain.error));
     }
@@ -341,8 +339,13 @@ fn sync_stream(s: &mut TcpStream, dir: &str) -> Result<(u64, usize, usize), Stri
         // 3. get-object: fetch and verify sha256(cipher) == blid.
         let mut blid = [0u8; 32];
         blid.copy_from_slice(&expected);
-        let obj = rpc2_call(s, "Peer.GetObject", 100 + i as u64, getobject_request(&blid))
-            .map_err(|e| e.to_string())?;
+        let obj = rpc2_call(
+            s,
+            "Peer.GetObject",
+            100 + i as u64,
+            getobject_request(&blid),
+        )
+        .map_err(|e| e.to_string())?;
         if !obj.error.is_empty() {
             eprintln!("sync: topo {top}: {}", obj.error);
             continue;
@@ -365,9 +368,7 @@ fn sync(addr: &str, dir: &str) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| format!("dir {dir}: {e}"))?;
     let mut s = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
     let (height, fetched, have) = sync_stream(&mut s, dir)?;
-    eprintln!(
-        "synced from {addr}: peer height {height}, fetched {fetched}, already had {have}"
-    );
+    eprintln!("synced from {addr}: peer height {height}, fetched {fetched}, already had {have}");
     Ok(())
 }
 
@@ -615,12 +616,12 @@ mod tests {
         assert_eq!(serve_body(&d, "nothex").unwrap_err(), "400 bad cid");
         assert_eq!(serve_body(&d, "abcd").unwrap_err(), "400 bad cid");
         // 63 hex chars (31.5 bytes) is one short.
+        assert_eq!(serve_body(&d, &"a".repeat(63)).unwrap_err(), "400 bad cid");
+        // Path traversal must be impossible: a ".." payload can't pass the hex gate.
         assert_eq!(
-            serve_body(&d, &"a".repeat(63)).unwrap_err(),
+            serve_body(&d, "../../etc/passwd").unwrap_err(),
             "400 bad cid"
         );
-        // Path traversal must be impossible: a ".." payload can't pass the hex gate.
-        assert_eq!(serve_body(&d, "../../etc/passwd").unwrap_err(), "400 bad cid");
     }
 
     #[test]
@@ -628,10 +629,8 @@ mod tests {
         // File exists but its sha256 != requested cid (corrupted or planted).
         let dir = mk_temp_dir("mismatch");
         let bogus_cid = "1111111111111111111111111111111111111111111111111111111111111111";
-        fs::write(dir.join(format!("{bogus_cid}.body")), b"actual bytes")
-            .unwrap();
-        let err =
-            serve_body(dir.clone().to_str().unwrap(), bogus_cid).unwrap_err();
+        fs::write(dir.join(format!("{bogus_cid}.body")), b"actual bytes").unwrap();
+        let err = serve_body(dir.clone().to_str().unwrap(), bogus_cid).unwrap_err();
         assert_eq!(err, "500 cid mismatch");
     }
 
@@ -737,10 +736,7 @@ mod tests {
     fn rpc2_chain_response_matches_dero_wire_shape() {
         // Conformance: Peer.Chain's payload must be a CBOR array of
         // [topoheight(uint), blid(32-byte bstr)] pairs, newest first.
-        let pairs = [
-            (2u64, [0xAAu8; 32]),
-            (1u64, [0x11u8; 32]),
-        ];
+        let pairs = [(2u64, [0xAAu8; 32]), (1u64, [0x11u8; 32])];
         let payload = chain_response(&pairs);
         let frame = p2p::cbor::message("", 9, "", payload);
         let m = p2p::decode_message(&frame).expect("decode");
@@ -785,7 +781,10 @@ mod tests {
         let m = p2p::decode_message(&resp).expect("object response decodes");
         assert_eq!(m.error, "");
         let body_hex = m.payload.as_str().expect("hex body");
-        assert_eq!(hex::decode(body_hex).unwrap(), b"rpc2 body for Peer.GetObject");
+        assert_eq!(
+            hex::decode(body_hex).unwrap(),
+            b"rpc2 body for Peer.GetObject"
+        );
 
         drop(client);
         server.join().unwrap();
@@ -811,12 +810,7 @@ mod tests {
         assert!(m.error.contains("501"), "got: {}", m.error);
 
         // Missing object -> E carries the 404.
-        let req = p2p::cbor::message(
-            "Peer.GetObject",
-            2,
-            "",
-            getobject_request(&[0xEE; 32]),
-        );
+        let req = p2p::cbor::message("Peer.GetObject", 2, "", getobject_request(&[0xEE; 32]));
         p2p::write_frame(&mut client, &req).unwrap();
         let m = p2p::decode_message(&p2p::read_frame(&mut client).unwrap()).unwrap();
         assert!(m.error.contains("404"), "got: {}", m.error);
@@ -869,11 +863,7 @@ mod tests {
     fn sync_stream_idempotent_second_run_fetches_nothing() {
         let server_dir = mk_temp_dir("sync-server2");
         let body = b"only one body here";
-        fs::write(
-            server_dir.join(format!("{}.body", sha256_hex(body))),
-            body,
-        )
-        .unwrap();
+        fs::write(server_dir.join(format!("{}.body", sha256_hex(body))), body).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let client_dir = mk_temp_dir("sync-client2");
