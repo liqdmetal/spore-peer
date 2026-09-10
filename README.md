@@ -25,6 +25,13 @@ Peers can also run the DERO rpc2 sync subset on the same port — one node
 exchanges its whole store with another in a single pass:
     spore-peer sync --addr <peer-host:port> --dir <store-dir>
 
+Stores converge across a managed peer list: add peers once, then let the
+loop keep the store up to date from every listed peer. A dead peer is
+logged and skipped — convergence never depends on every peer being online:
+    spore-peer peers --dir <store-dir> add <peer-host:port>
+    spore-peer peers --dir <store-dir> list
+    spore-peer sync-loop --dir <store-dir> --interval 30      # or --once
+
 Integrity is enforced both directions: a body whose sha256 != requested CID
 is rejected (`500 cid mismatch`), so a tampered or hostile peer can never
 hand you bytes you did not ask for.
