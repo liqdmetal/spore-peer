@@ -155,8 +155,12 @@ pub fn rpc2_call(
 
 /// Decode an rpc2 frame: a CBOR header map {M, S, E} followed (optionally) by
 /// one more CBOR item as the payload. Returns None on malformed input.
+///
+/// Hardened against hostile frames: depth-capped, no panics on truncated
+/// input, length arithmetic checked, and every decode consumes a measured
+/// byte count (no heuristics).
 pub fn decode_message(buf: &[u8]) -> Option<Rpc2Message> {
-    let head_v = decode_value(buf)?;
+    let (head_v, used) = decode_value(buf, 0)?;
     let obj = head_v.as_object()?;
     let method = obj
         .get("M")
@@ -169,9 +173,12 @@ pub fn decode_message(buf: &[u8]) -> Option<Rpc2Message> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let used = advance(buf, &head_v);
     let payload = if buf.len() > used {
-        decode_value(&buf[used..])?
+        let (v, used2) = decode_value(&buf[used..], 0)?;
+        if used2 == 0 {
+            return None; // a zero-consumption decode is malformed by definition
+        }
+        v
     } else {
         serde_json::Value::Null
     };
@@ -183,132 +190,105 @@ pub fn decode_message(buf: &[u8]) -> Option<Rpc2Message> {
     })
 }
 
-fn decode_value(buf: &[u8]) -> Option<serde_json::Value> {
-    if buf.is_empty() {
-        // None, not Null: a decode that runs past the end of the buffer must
-        // terminate the caller's element loop, never feed it an infinite
-        // stream of empty values.
-        return None;
+/// Maximum container nesting the decoder will follow. Real rpc2 traffic
+/// nests at most a handful of levels (header map -> chain array -> pair
+/// array = 3); anything deeper is rejected as hostile.
+const MAX_DEPTH: usize = 64;
+
+/// Decode one CBOR item at `buf[0..]` at nesting depth `depth`. Returns the
+/// JSON value and the number of bytes consumed. `None` on truncation,
+/// overflow, or depth exhaustion; a returned count of 0 is malformed.
+fn decode_value(buf: &[u8], depth: usize) -> Option<(serde_json::Value, usize)> {
+    if depth > MAX_DEPTH {
+        return None; // hostile nesting
     }
-    let ib = buf[0];
+    let (&ib, rest) = buf.split_first()?;
     let major = ib >> 5;
     let info = ib & 0x1f;
-    let (n, mut pos) = match info {
+    let (n, pos) = match info {
         0..=23 => (info as u64, 1usize),
-        24 => (*buf.get(1)? as u64, 2),
+        24 => (*rest.first()? as u64, 2),
         25 => (
-            u16::from_be_bytes(buf.get(1..3)?.try_into().ok()?) as u64,
+            u16::from_be_bytes(rest.get(0..2)?.try_into().ok()?) as u64,
             3,
         ),
         26 => (
-            u32::from_be_bytes(buf.get(1..5)?.try_into().ok()?) as u64,
+            u32::from_be_bytes(rest.get(0..4)?.try_into().ok()?) as u64,
             5,
         ),
-        27 => (u64::from_be_bytes(buf.get(1..9)?.try_into().ok()?), 9),
-        _ => return None,
+        27 => (u64::from_be_bytes(rest.get(0..8)?.try_into().ok()?), 9),
+        _ => return None, // indefinite length (info 31) and reserved infos
     };
     match major {
-        0 => Some(serde_json::json!(n)),
-        1 => Some(serde_json::json!(-1 - n as i128)),
-        2 => {
-            let b = buf.get(pos..pos + n as usize)?;
-            Some(serde_json::json!(hex::encode(b)))
+        0 => Some((serde_json::json!(n), pos)),
+        1 => {
+            // CBOR negint = -1 - n. Magnitudes below i64::MIN would panic
+            // serde_json's number conversion (found by the fuzz corpus):
+            // reject instead — the rpc2 subset never sends negints anyway.
+            let neg: i128 = -1 - n as i128;
+            if neg < i64::MIN as i128 {
+                return None;
+            }
+            Some((serde_json::json!(neg as i64), pos))
         }
-        3 => {
-            let s = std::str::from_utf8(buf.get(pos..pos + n as usize)?).ok()?;
-            Some(serde_json::json!(s))
+        2 | 3 => {
+            // checked_add + get: a length past the buffer end is truncation.
+            // `pos` is buf-space (bytes consumed by the head).
+            let end = pos.checked_add(n as usize)?;
+            let b = buf.get(pos..end)?;
+            if major == 3 {
+                let s = std::str::from_utf8(b).ok()?;
+                Some((serde_json::json!(s), end))
+            } else {
+                Some((serde_json::json!(hex::encode(b)), end))
+            }
         }
         4 => {
-            let mut arr = Vec::new();
+            // Children start at buf[pos]; every returned count is in the
+            // callee's own buffer space, so `at += used` stays buf-space.
+            let mut out = Vec::new();
+            let mut at = pos;
             for _ in 0..n {
-                let v = decode_value(&buf[pos..])?;
-                pos += advance(&buf[pos..], &v);
-                arr.push(v);
+                let (v, used) = decode_value(&buf[at..], depth + 1)?;
+                if used == 0 {
+                    return None;
+                }
+                at = at.checked_add(used)?;
+                out.push(v);
             }
-            Some(serde_json::Value::Array(arr))
+            Some((serde_json::Value::Array(out), at))
         }
         5 => {
             let mut m = serde_json::Map::new();
+            let mut at = pos;
             for _ in 0..n {
-                let k = decode_value(&buf[pos..])?;
-                pos += advance(&buf[pos..], &k);
-                let v = decode_value(&buf[pos..])?;
-                pos += advance(&buf[pos..], &v);
+                let (k, used) = decode_value(&buf[at..], depth + 1)?;
+                if used == 0 {
+                    return None;
+                }
+                at = at.checked_add(used)?;
+                let (v, used) = decode_value(&buf[at..], depth + 1)?;
+                if used == 0 {
+                    return None;
+                }
+                at = at.checked_add(used)?;
                 if let Some(ks) = k.as_str() {
                     m.insert(ks.to_string(), v);
                 }
             }
-            Some(serde_json::Value::Object(m))
+            Some((serde_json::Value::Object(m), at))
         }
         6 | 7 => {
-            // tags / simple: skip the extra byte
+            // tags / simple values / bools / null
             if major == 7 && info == 20 {
-                return Some(serde_json::Value::Bool(false));
+                Some((serde_json::Value::Bool(false), pos))
+            } else if major == 7 && info == 21 {
+                Some((serde_json::Value::Bool(true), pos))
+            } else {
+                Some((serde_json::Value::Null, pos))
             }
-            if major == 7 && info == 21 {
-                return Some(serde_json::Value::Bool(true));
-            }
-            if major == 7 && info == 22 {
-                return Some(serde_json::Value::Null);
-            }
-            Some(serde_json::Value::Null)
         }
         _ => None,
-    }
-}
-
-fn advance(buf: &[u8], _v: &serde_json::Value) -> usize {
-    // estimate the byte length of the encoded value by re-decoding —
-    // simplest correct approach: use the raw byte length from the head.
-    if buf.is_empty() {
-        return 0;
-    }
-    let ib = buf[0];
-    let info = ib & 0x1f;
-    let header = match info {
-        0..=23 => 1,
-        24 => 2,
-        25 => 3,
-        26 => 5,
-        27 => 9,
-        _ => 1,
-    };
-    let major = ib >> 5;
-    let n = match info {
-        0..=23 => info as u64,
-        24 => buf.get(1).copied().unwrap_or(0) as u64,
-        25 => u16::from_be_bytes([buf[1], buf[2]]) as u64,
-        26 => u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as u64,
-        27 => u64::from_be_bytes(buf[1..9].try_into().unwrap_or([0; 8])),
-        _ => 0,
-    };
-    match major {
-        2 | 3 => header + n as usize,
-        4 => {
-            // sum of children
-            let mut pos = header;
-            let mut total = header;
-            for _ in 0..n {
-                let step = advance(&buf[pos..], &serde_json::Value::Null);
-                pos += step;
-                total += step;
-            }
-            total
-        }
-        5 => {
-            let mut pos = header;
-            let mut total = header;
-            for _ in 0..n {
-                let sk = advance(&buf[pos..], &serde_json::Value::Null);
-                pos += sk;
-                total += sk;
-                let sv = advance(&buf[pos..], &serde_json::Value::Null);
-                pos += sv;
-                total += sv;
-            }
-            total
-        }
-        _ => header,
     }
 }
 

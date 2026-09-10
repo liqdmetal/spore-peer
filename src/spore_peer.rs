@@ -42,8 +42,10 @@ use std::fs;
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
-mod p2p;
-use p2p::{
+// The wire codec lives in the library crate (src/p2p.rs) so benchmarks and
+// hostile-frame tests can exercise it without spawning the binary.
+use spore_peer::p2p;
+use spore_peer::p2p::{
     chain_request, chain_response, decode_message, error_response, getobject_request,
     getobject_response, handshake_request, handshake_response, read_frame, rpc2_call, write_frame,
     Rpc2Message,

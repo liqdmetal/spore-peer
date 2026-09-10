@@ -5,11 +5,22 @@ edition = "2021"
 description = "spore-peer (m3) — P2P long-body transport for Spore, the no-relay multi-chain messenger. Clean-room BSD-3. Serves and fetches ECDH-encrypted bodies by CID with sha256 integrity."
 license = "BSD-3-Clause"
 
+[lib]
+name = "spore_peer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spore-peer"
+path = "src/spore_peer.rs"
+
 [dependencies]
 serde_json = "1"
 hex = "0.4"
 sha2 = "0.10"
 
-[[bin]]
-name = "spore-peer"
-path = "src/spore_peer.rs"
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "decoder"
+harness = false
