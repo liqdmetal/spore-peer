@@ -32,13 +32,19 @@
 //! Usage:
 //!   spore-peer serve --listen 0.0.0.0:8099 --dir <body-store-dir>   (sender)
 //!   spore-peer fetch --addr host:8099 --cid <64-hex> [--out file]   (recipient)
+//!   spore-peer sync  --addr host:8099 --dir <body-store-dir>        (rpc2 sync subset)
 //!
-//! Request (over the frame): JSON {"cid": "<64-hex>"}.
+//! Request (over the frame): JSON {"cid": "<64-hex>"}, or an rpc2/CBOR map
+//! (Peer.Handshake / Peer.Chain / Peer.GetObject) on the same port.
 use std::fs;
 use std::net::{TcpListener, TcpStream};
 
 mod p2p;
-use p2p::{read_frame, write_frame};
+use p2p::{
+    chain_request, chain_response, decode_message, error_response, getobject_request,
+    getobject_response, handshake_request, handshake_response, read_frame, rpc2_call,
+    write_frame, Rpc2Message,
+};
 
 /// Response status bytes (first byte of every response frame).
 const STATUS_OK: u8 = 0x00;
@@ -93,26 +99,138 @@ fn frame_err(msg: &str) -> Vec<u8> {
     out
 }
 
+/// The body store doubles as the ledger for the rpc2 sync subset: chain
+/// entries are the stored bodies' CIDs ordered oldest->newest by file mtime
+/// (topoheight = position in that order).
+fn chain_view(dir: &str) -> Vec<(u64, [u8; 32])> {
+    let rd = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut entries: Vec<(std::time::SystemTime, [u8; 32])> = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        // <64 hex>.body only — the length gate makes the [..64] slice safe.
+        if name.len() != 64 + 5 || !name.ends_with(".body") {
+            continue;
+        }
+        let cid = match hex_decode(&name[..64]) {
+            Some(c) if c.len() == 32 => c,
+            _ => continue,
+        };
+        let mt = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if let Ok(cid) = <[u8; 32]>::try_from(cid) {
+            entries.push((mt, cid));
+        }
+    }
+    entries.sort_by_key(|(t, _)| *t);
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, c))| (i as u64, c))
+        .collect()
+}
+
+/// handle_rpc2 answers one rpc2 request (the DERO peer sync subset) using the
+/// body store as its ledger. Single request/response per connection, matching
+/// the cid-fetch protocol's shape.
+fn handle_rpc2(s: &mut TcpStream, msg: &Rpc2Message, dir: &str) {
+    match msg.method.as_str() {
+        "Peer.Handshake" => {
+            let height = chain_view(dir).len() as u64;
+            let resp = handshake_response(height, 1);
+            let _ = write_frame(s, &p2p::cbor::message("", msg.seq, "", resp));
+        }
+        "Peer.Chain" => {
+            let top = msg.payload.get("TOP").and_then(|v| v.as_u64()).unwrap_or(0);
+            let n = msg
+                .payload
+                .get("N")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(128)
+                .min(5000) as usize;
+            let chain = chain_view(dir);
+            // TOP=0 means "from the tip"; otherwise walk down from topoheight
+            // <= TOP, newest first, at most n entries.
+            let mut selected: Vec<(u64, [u8; 32])> = Vec::new();
+            for (h, c) in chain.iter().rev() {
+                if top != 0 && *h > top {
+                    continue;
+                }
+                selected.push((*h, *c));
+                if selected.len() == n {
+                    break;
+                }
+            }
+            let resp = chain_response(&selected);
+            let _ = write_frame(s, &p2p::cbor::message("", msg.seq, "", resp));
+        }
+        "Peer.GetObject" => {
+            let blid_hex = msg
+                .payload
+                .get("BLID")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // serve_body already enforces 64-hex + sha256(cipher) == BLID —
+            // the same integrity rule the cid-fetch path applies.
+            match serve_body(dir, blid_hex) {
+                Ok(body) => {
+                    let resp = getobject_response(&body);
+                    let _ = write_frame(s, &p2p::cbor::message("", msg.seq, "", resp));
+                }
+                Err(e) => {
+                    let _ = write_frame(s, &error_response(msg.seq, &e));
+                }
+            }
+        }
+        _unknown => {
+            let _ = write_frame(s, &error_response(msg.seq, "501 unknown method"));
+        }
+    }
+}
+
 fn handle_client(s: &mut TcpStream, dir: &str) {
-    let body = match read_frame(s) {
-        Ok(b) => b,
-        Err(_) => return,
-    };
-    // Request is a small JSON object: {"cid":"<hex>"}.
-    let req: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(_) => {
-            let _ = write_frame(s, &frame_err("400 bad request"));
-            return;
+    // One connection, many requests: the rpc2 sync subset is persistent (the
+    // reference keeps peer connections open), so a syncing client does
+    // Handshake -> Chain -> GetObject... over a single socket. Legacy
+    // cid-fetch clients send one request and close; the read then errors and
+    // the loop exits. The two protocols can even interleave on one socket —
+    // dispatch is per-frame.
+    loop {
+        let body = match read_frame(s) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        // Dispatch: rpc2/CBOR (DERO peer sync) vs the legacy JSON cid-fetch.
+        // A CBOR map starts 0xa0..=0xbf; JSON always starts with '{' (0x7b),
+        // whose first 8 bytes decode as an absurd CBOR length — so a JSON
+        // frame never decodes as an rpc2 message and misdispatch is impossible.
+        if let Some(msg) = decode_message(&body) {
+            if !msg.method.is_empty() {
+                handle_rpc2(s, &msg, dir);
+                continue;
+            }
         }
-    };
-    let cid = req.get("cid").and_then(|c| c.as_str()).unwrap_or("");
-    match serve_body(dir, cid) {
-        Ok(data) => {
-            let _ = write_frame(s, &frame_ok(&data));
-        }
-        Err(e) => {
-            let _ = write_frame(s, &frame_err(&e));
+        // Request is a small JSON object: {"cid":"<hex>"}.
+        let req: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = write_frame(s, &frame_err("400 bad request"));
+                continue;
+            }
+        };
+        let cid = req.get("cid").and_then(|c| c.as_str()).unwrap_or("");
+        match serve_body(dir, cid) {
+            Ok(data) => {
+                let _ = write_frame(s, &frame_ok(&data));
+            }
+            Err(e) => {
+                let _ = write_frame(s, &frame_err(&e));
+            }
         }
     }
 }
@@ -179,10 +297,84 @@ fn fetch(addr: &str, cid: &str, out: Option<&str>) -> Result<(), String> {
     r
 }
 
+/// sync_stream runs the rpc2 sync subset against a peer: handshake (learn
+/// the peer's height), chain (what it has), then Peer.GetObject for every
+/// CID the local store is missing. Every body is sha256-verified against
+/// its blid before it touches disk — the same integrity rule as fetch.
+fn sync_stream(s: &mut TcpStream, dir: &str) -> Result<(u64, usize, usize), String> {
+    use sha2::{Digest, Sha256};
+
+    // 1. handshake: learn the peer's height.
+    let hs = rpc2_call(s, "Peer.Handshake", 1, handshake_request(1))
+        .map_err(|e| e.to_string())?;
+    if !hs.error.is_empty() {
+        return Err(format!("handshake: {}", hs.error));
+    }
+    let peer_height = hs.payload.get("H").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    // 2. chain: newest-first list of [topoheight, blid].
+    let chain = rpc2_call(s, "Peer.Chain", 2, chain_request(0, 5000))
+        .map_err(|e| e.to_string())?;
+    if !chain.error.is_empty() {
+        return Err(format!("chain: {}", chain.error));
+    }
+    let empty = Vec::new();
+    let entries = chain.payload.as_array().unwrap_or(&empty);
+    let mut fetched = 0usize;
+    let mut have = 0usize;
+    for (i, entry) in entries.iter().enumerate() {
+        let pair = entry.as_array().ok_or("chain entry not an array")?;
+        if pair.len() != 2 {
+            return Err("chain entry must be [topoheight, blid]".to_string());
+        }
+        let top = pair[0].as_u64().unwrap_or(0);
+        let blid_hex = pair[1].as_str().unwrap_or("");
+        let expected = hex_decode(blid_hex).ok_or("bad blid hex in chain")?;
+        let path = format!("{dir}/{blid_hex}.body");
+        if fs::metadata(&path).is_ok() {
+            have += 1;
+            continue; // already stored
+        }
+        if i >= 2000 {
+            break; // hard per-sync cap on object fetches
+        }
+        // 3. get-object: fetch and verify sha256(cipher) == blid.
+        let mut blid = [0u8; 32];
+        blid.copy_from_slice(&expected);
+        let obj = rpc2_call(s, "Peer.GetObject", 100 + i as u64, getobject_request(&blid))
+            .map_err(|e| e.to_string())?;
+        if !obj.error.is_empty() {
+            eprintln!("sync: topo {top}: {}", obj.error);
+            continue;
+        }
+        let body_hex = obj.payload.as_str().ok_or("object payload not bytes")?;
+        let body = hex::decode(body_hex).map_err(|e| e.to_string())?;
+        let mut h = Sha256::new();
+        h.update(&body);
+        if h.finalize()[..] != expected[..] {
+            return Err(format!("topo {top}: body sha256 != blid (tampered)"));
+        }
+        fs::write(&path, &body).map_err(|e| format!("write {path}: {e}"))?;
+        fetched += 1;
+    }
+    Ok((peer_height, fetched, have))
+}
+
+fn sync(addr: &str, dir: &str) -> Result<(), String> {
+    // First sync into a fresh store must not die on a missing directory.
+    fs::create_dir_all(dir).map_err(|e| format!("dir {dir}: {e}"))?;
+    let mut s = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    let (height, fetched, have) = sync_stream(&mut s, dir)?;
+    eprintln!(
+        "synced from {addr}: peer height {height}, fetched {fetched}, already had {have}"
+    );
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: spore-peer <serve|fetch> ...");
+        eprintln!("usage: spore-peer <serve|fetch|sync> ...");
         std::process::exit(2);
     }
     let code = match args[1].as_str() {
@@ -241,6 +433,36 @@ fn main() {
                     Ok(()) => 0,
                     Err(e) => {
                         eprintln!("fetch failed: {e}");
+                        1
+                    }
+                }
+            }
+        }
+        "sync" => {
+            let mut addr = String::new();
+            let mut dir = ".".to_string();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--addr" => {
+                        addr = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--dir" => {
+                        dir = args.get(i + 1).cloned().unwrap_or(dir);
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            if addr.is_empty() {
+                eprintln!("sync needs --addr");
+                2
+            } else {
+                match sync(&addr, &dir) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        eprintln!("sync failed: {e}");
                         1
                     }
                 }
@@ -484,6 +706,7 @@ mod tests {
 
         let mut client = std::net::TcpStream::connect(&addr).unwrap();
         fetch_stream(&mut client, &cid, None).expect("fetch must succeed");
+        drop(client); // handle_client is now persistent: close to release it
         server.join().unwrap();
     }
 
@@ -504,6 +727,204 @@ mod tests {
         let mut client = std::net::TcpStream::connect(&addr).unwrap();
         let err = fetch_stream(&mut client, cid, None).unwrap_err();
         assert!(err.contains("404"), "got: {err}");
+        drop(client); // handle_client is now persistent: close to release it
+        server.join().unwrap();
+    }
+
+    // --- rpc2 sync subset (Peer.Handshake / Peer.Chain / Peer.GetObject) ---
+
+    #[test]
+    fn rpc2_chain_response_matches_dero_wire_shape() {
+        // Conformance: Peer.Chain's payload must be a CBOR array of
+        // [topoheight(uint), blid(32-byte bstr)] pairs, newest first.
+        let pairs = [
+            (2u64, [0xAAu8; 32]),
+            (1u64, [0x11u8; 32]),
+        ];
+        let payload = chain_response(&pairs);
+        let frame = p2p::cbor::message("", 9, "", payload);
+        let m = p2p::decode_message(&frame).expect("decode");
+        let arr = m.payload.as_array().expect("array payload");
+        assert_eq!(arr.len(), 2);
+        // newest first
+        assert_eq!(arr[0][0].as_u64(), Some(2));
+        assert_eq!(arr[0][1].as_str(), Some(hex::encode([0xAAu8; 32]).as_str()));
+        assert_eq!(arr[1][0].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn rpc2_request_dispatch_and_getobject_roundtrip() {
+        let (dir, cid) = fixture_dir(b"rpc2 body for Peer.GetObject");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let dirpath = dir.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut s = stream;
+            handle_client(&mut s, dirpath.to_str().unwrap());
+        });
+
+        let mut client = std::net::TcpStream::connect(&addr).unwrap();
+        // A real Peer.Chain request frame: header map with M/S/E + payload map.
+        let req = p2p::cbor::message("Peer.Chain", 7, "", chain_request(0, 100));
+        p2p::write_frame(&mut client, &req).unwrap();
+        let resp = p2p::read_frame(&mut client).unwrap();
+        let m = p2p::decode_message(&resp).expect("response decodes");
+        assert_eq!(m.error, "");
+        assert_eq!(m.seq, 7);
+        let entries = m.payload.as_array().expect("chain array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0][1].as_str(), Some(cid.as_str()));
+
+        // Peer.GetObject for that blid on the SAME connection (persistent rpc2).
+        let mut blid = [0u8; 32];
+        blid.copy_from_slice(&hex_decode(&cid).unwrap());
+        let req = p2p::cbor::message("Peer.GetObject", 8, "", getobject_request(&blid));
+        p2p::write_frame(&mut client, &req).unwrap();
+        let resp = p2p::read_frame(&mut client).unwrap();
+        let m = p2p::decode_message(&resp).expect("object response decodes");
+        assert_eq!(m.error, "");
+        let body_hex = m.payload.as_str().expect("hex body");
+        assert_eq!(hex::decode(body_hex).unwrap(), b"rpc2 body for Peer.GetObject");
+
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn rpc2_error_for_unknown_method_and_missing_object() {
+        let dir = mk_temp_dir("rpc2-errors");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let dirpath = dir.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut s = stream;
+            handle_client(&mut s, dirpath.to_str().unwrap());
+        });
+
+        let mut client = std::net::TcpStream::connect(&addr).unwrap();
+        // Unknown method -> E is set.
+        let req = p2p::cbor::message("Peer.Nope", 1, "", Vec::new());
+        p2p::write_frame(&mut client, &req).unwrap();
+        let m = p2p::decode_message(&p2p::read_frame(&mut client).unwrap()).unwrap();
+        assert!(m.error.contains("501"), "got: {}", m.error);
+
+        // Missing object -> E carries the 404.
+        let req = p2p::cbor::message(
+            "Peer.GetObject",
+            2,
+            "",
+            getobject_request(&[0xEE; 32]),
+        );
+        p2p::write_frame(&mut client, &req).unwrap();
+        let m = p2p::decode_message(&p2p::read_frame(&mut client).unwrap()).unwrap();
+        assert!(m.error.contains("404"), "got: {}", m.error);
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn sync_stream_end_to_end_fills_missing_bodies() {
+        // Server has three bodies; client starts empty; sync must fetch all
+        // three, verify sha256==blid, store them, and skip nothing.
+        let server_dir = mk_temp_dir("sync-server");
+        let bodies: Vec<Vec<u8>> = vec![
+            b"body one".to_vec(),
+            b"body two".to_vec(),
+            b"body three".to_vec(),
+        ];
+        let mut cids = Vec::new();
+        for b in &bodies {
+            let cid = sha256_hex(b);
+            fs::write(server_dir.join(format!("{cid}.body")), b).unwrap();
+            cids.push(cid);
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let dirpath = server_dir.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut s = stream;
+            handle_client(&mut s, dirpath.to_str().unwrap());
+        });
+
+        let client_dir = mk_temp_dir("sync-client");
+        let mut client = std::net::TcpStream::connect(&addr).unwrap();
+        let (height, fetched, _have) =
+            sync_stream(&mut client, client_dir.to_str().unwrap()).expect("sync");
+        assert_eq!(height, 3);
+        assert_eq!(fetched, 3);
+        drop(client);
+        server.join().unwrap();
+
+        // All three bodies landed, integrity-verified, in the client store.
+        for (cid, body) in cids.iter().zip(bodies.iter()) {
+            let stored = fs::read(client_dir.join(format!("{cid}.body"))).expect("stored");
+            assert_eq!(&stored, body);
+        }
+    }
+
+    #[test]
+    fn sync_stream_idempotent_second_run_fetches_nothing() {
+        let server_dir = mk_temp_dir("sync-server2");
+        let body = b"only one body here";
+        fs::write(
+            server_dir.join(format!("{}.body", sha256_hex(body))),
+            body,
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let client_dir = mk_temp_dir("sync-client2");
+        let dirpath = server_dir.clone();
+        // One server thread serving TWO sequential connections (first sync,
+        // then the idempotent re-sync).
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut s = stream;
+                handle_client(&mut s, dirpath.to_str().unwrap());
+            }
+        });
+
+        let mut client = std::net::TcpStream::connect(&addr).unwrap();
+        let (height, fetched, _have) =
+            sync_stream(&mut client, client_dir.to_str().unwrap()).expect("first sync");
+        assert_eq!((height, fetched), (1, 1));
+        drop(client);
+
+        // Second run over a fresh socket: nothing new to fetch.
+        let mut client2 = std::net::TcpStream::connect(&addr).unwrap();
+        let (height, fetched, have) =
+            sync_stream(&mut client2, client_dir.to_str().unwrap()).expect("second sync");
+        assert_eq!((height, fetched, have), (1, 0, 1));
+        drop(client2);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_json_and_rpc2_interleave_on_one_socket() {
+        // Protocol independence: the same connection serves a JSON cid-fetch
+        // AND an rpc2 request, per-frame.
+        let (dir, cid) = fixture_dir(b"shared socket body");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let dirpath = dir.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut s = stream;
+            handle_client(&mut s, dirpath.to_str().unwrap());
+        });
+
+        let mut client = std::net::TcpStream::connect(&addr).unwrap();
+        fetch_stream(&mut client, &cid, None).expect("json fetch");
+        let req = p2p::cbor::message("Peer.Chain", 5, "", chain_request(0, 10));
+        p2p::write_frame(&mut client, &req).unwrap();
+        let m = p2p::decode_message(&p2p::read_frame(&mut client).unwrap()).unwrap();
+        assert_eq!(m.error, "");
+        assert_eq!(m.payload.as_array().unwrap().len(), 1);
+        drop(client);
         server.join().unwrap();
     }
 

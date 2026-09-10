@@ -9,21 +9,12 @@
 //!          Peer.Handshake (the initial hello).
 //!
 //! This is the real DERO P2P wire format (rpc2 over CBOR), used by the
-//! reference daemon on port 11010. We implement the client + server side
-//! of the sync subset so Rust nodes can exchange blocks directly.
-
-// The rpc2/CBOR codec below is a clean-room port of the reference daemon's
-// wire protocol, staged ahead of wiring Peer.Chain/GetObject into the live
-// sync loop. Both the encoder and decoder halves are kept complete and
-// symmetric on purpose; until the sync loop consumes them all, dead_code
-// is silenced here rather than sawing the protocol implementation in half.
-#![allow(dead_code)]
+//! reference daemon on port 11010. spore-peer implements the client + server
+//! side of the sync subset so Rust nodes can exchange stored bodies directly;
+//! the live sync loop in spore_peer.rs drives it.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-
-/// Network ID for the simulator/testnet (16 bytes).
-pub const NETWORK_ID_TESTNET: [u8; 16] = *b"DERO_TESTNET_000";
 
 /// Send a CBOR frame: 4-byte LE length + payload.
 pub fn write_frame(w: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
@@ -49,7 +40,7 @@ pub fn read_frame(r: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// A simple JSON-RPC-style request/response over the CBOR framing.
+/// A decoded rpc2 message: the header map plus the (optional) payload item.
 #[derive(Debug, Clone)]
 pub struct Rpc2Message {
     pub method: String, // "Peer.Chain" etc (empty for responses)
@@ -88,14 +79,6 @@ pub mod cbor {
         out
     }
 
-    pub fn int(v: i64) -> Vec<u8> {
-        if v >= 0 {
-            head(0, v as u64)
-        } else {
-            head(1, (-1 - v) as u64)
-        }
-    }
-
     pub fn uint(v: u64) -> Vec<u8> {
         head(0, v)
     }
@@ -114,14 +97,6 @@ pub mod cbor {
         head(5, n as u64)
     }
 
-    pub fn bool(b: bool) -> Vec<u8> {
-        vec![if b { 0xf5 } else { 0xf4 }]
-    }
-
-    pub fn null() -> Vec<u8> {
-        vec![0xf6]
-    }
-
     /// Encode a key:value pair.
     pub fn kv(key: &str, val: &[u8]) -> Vec<u8> {
         let mut out = text(key);
@@ -129,7 +104,7 @@ pub mod cbor {
         out
     }
 
-    /// A 32-byte hash as a byte-string (BLIST entries).
+    /// A 32-byte hash as a byte-string (BLID/CID entries).
     pub fn hash32(h: &[u8; 32]) -> Vec<u8> {
         bytes(h)
     }
@@ -138,12 +113,12 @@ pub mod cbor {
     /// header map then the payload object as separate CBOR items — the
     /// reference's WriteRequest writes TWO frames: header then object).
     pub fn header(method: &str, seq: u64, err: &str) -> Vec<u8> {
-        // the reference ALWAYS emits the E field (even empty) — fxamacker
-        // marshals the struct with all fields
+        // the reference ALWAYS emits M, S and E (fxamacker marshals the struct
+        // with all fields, even when M or E is empty) — the map count must
+        // match the pairs actually written or the decoder will swallow the
+        // payload item as a phantom pair.
         let mut out = map(3);
-        if !method.is_empty() {
-            out.extend_from_slice(&kv("M", &text(method)));
-        }
+        out.extend_from_slice(&kv("M", &text(method)));
         out.extend_from_slice(&kv("S", &uint(seq)));
         out.extend_from_slice(&kv("E", &text(err)));
         out
@@ -158,7 +133,8 @@ pub mod cbor {
     }
 }
 
-/// Send a request and read the response (sync subset).
+/// Send a request and read the response (sync subset). Returns the decoded
+/// response header (M/S/E) and payload; a non-empty E is the caller's error.
 pub fn rpc2_call(
     stream: &mut TcpStream,
     method: &str,
@@ -168,28 +144,43 @@ pub fn rpc2_call(
     let frame = cbor::message(method, seq, "", body);
     write_frame(stream, &frame)?;
     let resp = read_frame(stream)?;
-    // decode the response: it's a CBOR map; parse minimal fields via a
-    // tiny decoder (we only need M/S/E + pass the rest through raw)
-    Ok(Rpc2Message {
-        method: String::new(),
-        seq,
-        error: String::new(),
-        payload: decode_map(&resp),
-    })
+    match decode_message(&resp) {
+        Some(m) => Ok(m),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "undecodable rpc2 response",
+        )),
+    }
 }
 
-/// Minimal CBOR map -> JSON decoder (text keys, the tagged fields we need).
-/// This is intentionally small: it handles the structs we send/receive.
-pub fn decode_map(buf: &[u8]) -> serde_json::Value {
-    match decode_value(buf) {
-        Some(v) => v,
-        None => serde_json::Value::Null,
-    }
+/// Decode an rpc2 frame: a CBOR header map {M, S, E} followed (optionally) by
+/// one more CBOR item as the payload. Returns None on malformed input.
+pub fn decode_message(buf: &[u8]) -> Option<Rpc2Message> {
+    let head_v = decode_value(buf)?;
+    let obj = head_v.as_object()?;
+    let method = obj.get("M").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let seq = obj.get("S").and_then(|v| v.as_u64()).unwrap_or(0);
+    let error = obj.get("E").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let used = advance(buf, &head_v);
+    let payload = if buf.len() > used {
+        decode_value(&buf[used..])?
+    } else {
+        serde_json::Value::Null
+    };
+    Some(Rpc2Message {
+        method,
+        seq,
+        error,
+        payload,
+    })
 }
 
 fn decode_value(buf: &[u8]) -> Option<serde_json::Value> {
     if buf.is_empty() {
-        return Some(serde_json::Value::Null);
+        // None, not Null: a decode that runs past the end of the buffer must
+        // terminate the caller's element loop, never feed it an infinite
+        // stream of empty values.
+        return None;
     }
     let ib = buf[0];
     let major = ib >> 5;
@@ -310,5 +301,111 @@ fn advance(buf: &[u8], _v: &serde_json::Value) -> usize {
             total
         }
         _ => header,
+    }
+}
+
+// --- rpc2 payload builders (the sync subset spore-peer actually speaks) ---
+
+/// Peer.Handshake request payload: {"N": network/version id}.
+pub fn handshake_request(version: u64) -> Vec<u8> {
+    let mut out = cbor::map(1);
+    out.extend_from_slice(&cbor::kv("N", &cbor::uint(version)));
+    out
+}
+
+/// Peer.Handshake response payload: {"H": chain height, "N": version}.
+pub fn handshake_response(height: u64, version: u64) -> Vec<u8> {
+    let mut out = cbor::map(2);
+    out.extend_from_slice(&cbor::kv("H", &cbor::uint(height)));
+    out.extend_from_slice(&cbor::kv("N", &cbor::uint(version)));
+    out
+}
+
+/// Peer.Chain request payload: {"TOP": topoheight to start at (0 = peer's tip),
+/// "N": max entries}.
+pub fn chain_request(top: u64, n: u64) -> Vec<u8> {
+    let mut out = cbor::map(2);
+    out.extend_from_slice(&cbor::kv("TOP", &cbor::uint(top)));
+    out.extend_from_slice(&cbor::kv("N", &cbor::uint(n)));
+    out
+}
+
+/// Peer.Chain response payload: array of [topoheight, blid(32B)] pairs,
+/// newest first.
+pub fn chain_response(pairs: &[(u64, [u8; 32])]) -> Vec<u8> {
+    let mut out = cbor::array(pairs.len());
+    for (h, blid) in pairs {
+        out.extend_from_slice(&cbor::array(2));
+        out.extend_from_slice(&cbor::uint(*h));
+        out.extend_from_slice(&cbor::hash32(blid));
+    }
+    out
+}
+
+/// Peer.GetObject request payload: {"BLID": 32-byte hash}.
+pub fn getobject_request(blid: &[u8; 32]) -> Vec<u8> {
+    let mut out = cbor::map(1);
+    out.extend_from_slice(&cbor::kv("BLID", &cbor::hash32(blid)));
+    out
+}
+
+/// Peer.GetObject response payload: the raw object bytes.
+pub fn getobject_response(body: &[u8]) -> Vec<u8> {
+    cbor::bytes(body)
+}
+
+/// An rpc2 error response: empty method, echoed seq, E = message.
+pub fn error_response(seq: u64, msg: &str) -> Vec<u8> {
+    cbor::message("", seq, msg, Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_message_roundtrips_header_and_payload() {
+        let body = chain_response(&[(7, [9u8; 32]), (6, [3u8; 32])]);
+        let frame = cbor::message("Peer.Chain", 42, "", body);
+        let m = decode_message(&frame).expect("decode");
+        assert_eq!(m.method, "Peer.Chain");
+        assert_eq!(m.seq, 42);
+        assert_eq!(m.error, "");
+        let pairs = m.payload.as_array().expect("payload array");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0][0].as_u64(), Some(7));
+        let blid = hex::encode([9u8; 32]);
+        assert_eq!(pairs[0][1].as_str(), Some(blid.as_str()));
+    }
+
+    #[test]
+    fn decode_message_handles_error_response() {
+        let frame = cbor::message("", 5, "404 not found", Vec::new());
+        let m = decode_message(&frame).expect("decode");
+        assert_eq!(m.method, "");
+        assert_eq!(m.error, "404 not found");
+        assert_eq!(m.seq, 5);
+    }
+
+    #[test]
+    fn decode_message_without_payload_is_null() {
+        let frame = cbor::header("Peer.Handshake", 1, "");
+        let m = decode_message(&frame).expect("decode");
+        assert_eq!(m.method, "Peer.Handshake");
+        assert!(m.payload.is_null());
+    }
+
+    #[test]
+    fn getobject_payload_is_hex_body() {
+        let frame = cbor::message("", 3, "", getobject_response(b"BINARY\x00DATA"));
+        let m = decode_message(&frame).expect("decode");
+        let want = hex::encode(b"BINARY\x00DATA");
+        assert_eq!(m.payload.as_str(), Some(want.as_str()));
+    }
+
+    #[test]
+    fn decode_message_rejects_garbage() {
+        assert!(decode_message(&[0xff, 0xff, 0xff]).is_none());
+        assert!(decode_message(&[]).is_none());
     }
 }
