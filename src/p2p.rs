@@ -6,7 +6,7 @@
 //!   header:  {M: method, S: seq, E: error}
 //!   payload: CBOR map with the tagged struct fields (COMMON, BLIST, ...)
 //! Methods: Peer.Chain (block list sync), Peer.GetObject (block bodies),
-//!          Peer.Handshake (the initial hello).
+//!          Peer.PutObject (push a stored body), Peer.Handshake (the hello).
 //!
 //! This is the real DERO P2P wire format (rpc2 over CBOR), used by the
 //! reference daemon on port 11010. spore-peer implements the client + server
@@ -342,6 +342,23 @@ pub fn getobject_response(body: &[u8]) -> Vec<u8> {
     cbor::bytes(body)
 }
 
+/// Peer.PutObject request payload: {"BLID": 32-byte hash, "BODY": raw bytes}.
+/// The server recomputes sha256(BODY) and stores under the hash it COMPUTED,
+/// rejecting the object outright if it does not match BLID.
+pub fn putobject_request(blid: &[u8; 32], body: &[u8]) -> Vec<u8> {
+    let mut out = cbor::map(2);
+    out.extend_from_slice(&cbor::kv("BLID", &cbor::hash32(blid)));
+    out.extend_from_slice(&cbor::kv("BODY", &cbor::bytes(body)));
+    out
+}
+
+/// Peer.PutObject response payload: {"BLID": the hash actually stored}.
+pub fn putobject_response(blid: &[u8; 32]) -> Vec<u8> {
+    let mut out = cbor::map(1);
+    out.extend_from_slice(&cbor::kv("BLID", &cbor::hash32(blid)));
+    out
+}
+
 /// An rpc2 error response: empty method, echoed seq, E = message.
 pub fn error_response(seq: u64, msg: &str) -> Vec<u8> {
     cbor::message("", seq, msg, Vec::new())
@@ -395,5 +412,27 @@ mod tests {
     fn decode_message_rejects_garbage() {
         assert!(decode_message(&[0xff, 0xff, 0xff]).is_none());
         assert!(decode_message(&[]).is_none());
+    }
+
+    #[test]
+    fn putobject_roundtrips_blid_and_body() {
+        let blid = [7u8; 32];
+        let body = b"pushed body bytes";
+        let frame = cbor::message("Peer.PutObject", 11, "", putobject_request(&blid, body));
+        let m = decode_message(&frame).expect("decode");
+        assert_eq!(m.method, "Peer.PutObject");
+        assert_eq!(
+            m.payload.get("BLID").and_then(|v| v.as_str()),
+            Some(hex::encode(blid).as_str())
+        );
+        let body_hex = m.payload.get("BODY").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(hex::decode(body_hex).unwrap(), body);
+
+        let resp = cbor::message("", 11, "", putobject_response(&blid));
+        let m = decode_message(&resp).expect("decode");
+        assert_eq!(
+            m.payload.get("BLID").and_then(|v| v.as_str()),
+            Some(hex::encode(blid).as_str())
+        );
     }
 }

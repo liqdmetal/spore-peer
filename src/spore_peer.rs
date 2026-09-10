@@ -32,12 +32,14 @@
 //! Usage:
 //!   spore-peer serve --listen 0.0.0.0:8099 --dir <body-store-dir>   (sender)
 //!   spore-peer fetch --addr host:8099 --cid <64-hex> [--out file]   (recipient)
-//!   spore-peer sync  --addr host:8099 --dir <body-store-dir>        (rpc2 sync subset)
+//!   spore-peer sync  --addr host:8099 --dir <body-store-dir>        (rpc2 pull subset)
+//!   spore-peer push  --addr host:8099 --dir <body-store-dir>        (rpc2 push subset)
 //!   spore-peer peers --dir <store> add|remove <host:port> | list    (peer list)
-//!   spore-peer sync-loop --dir <store> [--interval 30] [--once]     (converge from all peers)
+//!   spore-peer sync-loop --dir <store> [--interval 30] [--once]     (bidirectional convergence)
 //!
 //! Request (over the frame): JSON {"cid": "<64-hex>"}, or an rpc2/CBOR map
-//! (Peer.Handshake / Peer.Chain / Peer.GetObject) on the same port.
+//! (Peer.Handshake / Peer.Chain / Peer.GetObject / Peer.PutObject) on the
+//! same port.
 use std::fs;
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
@@ -47,9 +49,46 @@ use std::time::Duration;
 use spore_peer::p2p;
 use spore_peer::p2p::{
     chain_request, chain_response, decode_message, error_response, getobject_request,
-    getobject_response, handshake_request, handshake_response, read_frame, rpc2_call, write_frame,
-    Rpc2Message,
+    getobject_response, handshake_request, handshake_response, putobject_request,
+    putobject_response, read_frame, rpc2_call, write_frame, Rpc2Message,
 };
+
+/// Largest body a peer may push into the local store (also the frame cap's
+/// practical limit: a push request carries BLID + BODY in one CBOR frame).
+const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// store_body writes `body` into the store under the hash it COMPUTES, never
+/// under a caller-supplied name: the only way a file lands in the store is
+/// with sha256(body) == its filename. Returns the 64-hex CID. Integrity rule
+/// is identical for locally-stored and peer-pushed bodies.
+fn store_body(dir: &str, body: &[u8]) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    if body.is_empty() {
+        return Err("400 empty body".to_string());
+    }
+    if body.len() > MAX_BODY_BYTES {
+        return Err("413 body too large".to_string());
+    }
+    let mut h = Sha256::new();
+    h.update(body);
+    let cid = h.finalize();
+    let cid_hex = hex::encode(cid);
+    let final_path = format!("{dir}/{cid_hex}.body");
+    if fs::metadata(&final_path).is_ok() {
+        return Ok(cid_hex); // already stored — a push of a known body is a no-op
+    }
+    fs::create_dir_all(dir).map_err(|e| format!("dir {dir}: {e}"))?;
+    // Write to a temp name in the same directory, then rename: a concurrent
+    // reader can never observe a half-written body (rename is atomic on the
+    // platforms spore-peer targets).
+    let tmp_path = format!("{dir}/.incoming-{cid_hex}.part");
+    fs::write(&tmp_path, body).map_err(|e| format!("write {tmp_path}: {e}"))?;
+    if let Err(e) = fs::rename(&tmp_path, &final_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("rename {tmp_path}: {e}"));
+    }
+    Ok(cid_hex)
+}
 
 /// Response status bytes (first byte of every response frame).
 const STATUS_OK: u8 = 0x00;
@@ -144,6 +183,7 @@ fn chain_view(dir: &str) -> Vec<(u64, [u8; 32])> {
 /// body store as its ledger. The caller loops per frame, so one connection
 /// serves many requests.
 fn handle_rpc2(s: &mut TcpStream, msg: &Rpc2Message, dir: &str) {
+    use sha2::{Digest, Sha256};
     match msg.method.as_str() {
         "Peer.Handshake" => {
             let height = chain_view(dir).len() as u64;
@@ -185,6 +225,53 @@ fn handle_rpc2(s: &mut TcpStream, msg: &Rpc2Message, dir: &str) {
             match serve_body(dir, blid_hex) {
                 Ok(body) => {
                     let resp = getobject_response(&body);
+                    let _ = write_frame(s, &p2p::cbor::message("", msg.seq, "", resp));
+                }
+                Err(e) => {
+                    let _ = write_frame(s, &error_response(msg.seq, &e));
+                }
+            }
+        }
+        "Peer.PutObject" => {
+            // Push direction: a peer hands us a body it believes we lack. The
+            // server is the judge — sha256(BODY) is recomputed here and must
+            // equal BLID, and the file is stored under the hash WE computed
+            // (store_body). A lying or corrupting peer gets a 400 and writes
+            // nothing; a valid body of any claimed name lands under its true
+            // hash. Size cap and empty-body rejection live in store_body.
+            let body_hex = msg
+                .payload
+                .get("BODY")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let body = match hex::decode(body_hex) {
+                Ok(b) => b,
+                Err(_) => {
+                    let _ = write_frame(s, &error_response(msg.seq, "400 body not valid hex"));
+                    return;
+                }
+            };
+            let blid_hex = msg
+                .payload
+                .get("BLID")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let mut h = Sha256::new();
+            h.update(&body);
+            let digest = h.finalize();
+            let blid_ok =
+                hex_decode(blid_hex).is_some_and(|b| b.len() == 32 && b[..] == digest[..]);
+            if !blid_ok {
+                let _ = write_frame(s, &error_response(msg.seq, "400 body sha256 != BLID"));
+                return;
+            }
+            match store_body(dir, &body) {
+                Ok(cid_hex) => {
+                    let mut blid = [0u8; 32];
+                    if let Some(b) = hex_decode(&cid_hex) {
+                        blid.copy_from_slice(&b);
+                    }
+                    let resp = putobject_response(&blid);
                     let _ = write_frame(s, &p2p::cbor::message("", msg.seq, "", resp));
                 }
                 Err(e) => {
@@ -377,6 +464,96 @@ fn sync(addr: &str, dir: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// push_stream is the inverse of sync_stream: after the handshake, pull the
+/// peer's chain and Peer.PutObject every LOCAL body the peer is missing,
+/// sha256-verified locally before sending (the server re-verifies anyway —
+/// we just refuse to ship garbage). Returns (peer_height, pushed, peer_had).
+fn push_stream(s: &mut TcpStream, dir: &str) -> Result<(u64, usize, usize), String> {
+    // 1. handshake: learn the peer's height (also proves it speaks rpc2).
+    let hs = rpc2_call(s, "Peer.Handshake", 1, handshake_request(1)).map_err(|e| e.to_string())?;
+    if !hs.error.is_empty() {
+        return Err(format!("handshake: {}", hs.error));
+    }
+    let peer_height = hs.payload.get("H").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    // 2. chain: everything the peer already has, newest-first.
+    let chain = rpc2_call(s, "Peer.Chain", 2, chain_request(0, 5000)).map_err(|e| e.to_string())?;
+    if !chain.error.is_empty() {
+        return Err(format!("chain: {}", chain.error));
+    }
+    let empty = Vec::new();
+    let entries = chain.payload.as_array().unwrap_or(&empty);
+    let mut peer_has: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in entries {
+        let pair = entry.as_array().ok_or("chain entry not an array")?;
+        if pair.len() != 2 {
+            return Err("chain entry must be [topoheight, blid]".to_string());
+        }
+        peer_has.insert(pair[1].as_str().unwrap_or("").to_string());
+    }
+
+    // 3. push every local body the peer lacks (mtime order = topo order).
+    let mut pushed = 0usize;
+    let mut attempted = 0usize;
+    for (topo, cid) in chain_view(dir) {
+        if peer_has.contains(&hex::encode(cid)) {
+            continue; // peer already has it
+        }
+        if attempted >= 2000 {
+            break; // same per-pass cap as the pull direction
+        }
+        attempted += 1;
+        let path = format!("{dir}/{}.body", hex::encode(cid));
+        let body = fs::read(&path).map_err(|e| format!("read {path}: {e}"))?;
+        // Never ship bytes that do not hash to the CID we advertise.
+        {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&body);
+            if h.finalize()[..] != cid[..] {
+                eprintln!("push: skipping corrupt store file for topo {topo}");
+                continue;
+            }
+        }
+        let resp = rpc2_call(
+            s,
+            "Peer.PutObject",
+            200 + attempted as u64,
+            putobject_request(&cid, &body),
+        )
+        .map_err(|e| e.to_string())?;
+        if !resp.error.is_empty() {
+            eprintln!("push: topo {topo}: {}", resp.error);
+            continue;
+        }
+        // The server answers with the hash it actually stored; a mismatch
+        // means we and the peer disagree about the object — fail loudly.
+        let stored = resp
+            .payload
+            .get("BLID")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if stored != hex::encode(cid) {
+            return Err(format!(
+                "topo {topo}: peer stored different hash ({stored})"
+            ));
+        }
+        pushed += 1;
+    }
+    Ok((peer_height, pushed, peer_has.len()))
+}
+
+/// push runs one push pass against a single peer.
+fn push(addr: &str, dir: &str) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("dir {dir}: {e}"))?;
+    let mut s = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    let (height, pushed, peer_had) = push_stream(&mut s, dir)?;
+    eprintln!(
+        "pushed to {addr}: peer height {height}, pushed {pushed}, peer already had {peer_had}"
+    );
+    Ok(())
+}
+
 // --- multi-peer convergence (peers list + periodic sync loop) ---
 
 /// The peers list lives in the store dir as `peers.txt`: one `host:port` per
@@ -467,33 +644,47 @@ fn peers_remove(dir: &str, addr: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-/// One convergence pass: sync from every peer in the list. A dead or
-/// unreachable peer is logged and skipped, never fatal — convergence must
-/// not depend on every peer being online. Returns (ok, failed, fetched).
+/// One convergence pass, bidirectional: for every peer in the list, PULL
+/// what it has and PUSH what it lacks, over one socket each (the rpc2
+/// connection is persistent). A dead or unreachable peer is logged and
+/// skipped, never fatal — convergence must not depend on every peer being
+/// online. Returns (ok, failed, transferred = bodies fetched + pushed).
 fn sync_pass(dir: &str) -> (usize, usize, u64) {
     let peers = peers_list(dir);
     let mut ok = 0usize;
     let mut failed = 0usize;
-    let mut fetched = 0u64;
+    let mut transferred = 0u64;
     for addr in &peers {
         match TcpStream::connect(addr) {
-            Ok(mut s) => match sync_stream(&mut s, dir) {
-                Ok((_, f, _)) => {
-                    ok += 1;
-                    fetched += f as u64;
+            Ok(mut s) => {
+                let pull = sync_stream(&mut s, dir);
+                let push = if pull.is_ok() {
+                    push_stream(&mut s, dir)
+                } else {
+                    Err("skipped (pull failed)".to_string())
+                };
+                match (pull, push) {
+                    (Ok((_, f, _)), Ok((_, p, _))) => {
+                        ok += 1;
+                        transferred += (f + p) as u64;
+                    }
+                    (Err(e), _) => {
+                        eprintln!("sync-loop: {addr}: {e}");
+                        failed += 1;
+                    }
+                    (_, Err(e)) => {
+                        eprintln!("sync-loop: {addr}: push: {e}");
+                        failed += 1;
+                    }
                 }
-                Err(e) => {
-                    eprintln!("sync-loop: {addr}: {e}");
-                    failed += 1;
-                }
-            },
+            }
             Err(e) => {
                 eprintln!("sync-loop: {addr}: unreachable ({e})");
                 failed += 1;
             }
         }
     }
-    (ok, failed, fetched)
+    (ok, failed, transferred)
 }
 
 /// Periodic convergence loop: one sync_pass every `interval` seconds, forever
@@ -501,12 +692,12 @@ fn sync_pass(dir: &str) -> (usize, usize, u64) {
 fn sync_loop(dir: &str, interval: u64, once: bool) -> Result<(usize, usize, u64), String> {
     fs::create_dir_all(dir).map_err(|e| format!("dir {dir}: {e}"))?;
     loop {
-        let (ok, failed, fetched) = sync_pass(dir);
+        let (ok, failed, transferred) = sync_pass(dir);
         eprintln!(
-            "sync-loop: pass done: {ok} peer(s) synced, {failed} failed, {fetched} body(ies) fetched"
+            "sync-loop: pass done: {ok} peer(s) synced, {failed} failed, {transferred} body(ies) transferred"
         );
         if once {
-            return Ok((ok, failed, fetched));
+            return Ok((ok, failed, transferred));
         }
         std::thread::sleep(Duration::from_secs(interval));
     }
@@ -515,7 +706,7 @@ fn sync_loop(dir: &str, interval: u64, once: bool) -> Result<(usize, usize, u64)
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: spore-peer <serve|fetch|sync|peers|sync-loop> ...");
+        eprintln!("usage: spore-peer <serve|fetch|sync|push|peers|sync-loop> ...");
         std::process::exit(2);
     }
     let code = match args[1].as_str() {
@@ -604,6 +795,36 @@ fn main() {
                     Ok(()) => 0,
                     Err(e) => {
                         eprintln!("sync failed: {e}");
+                        1
+                    }
+                }
+            }
+        }
+        "push" => {
+            let mut addr = String::new();
+            let mut dir = ".".to_string();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--addr" => {
+                        addr = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--dir" => {
+                        dir = args.get(i + 1).cloned().unwrap_or(dir);
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            if addr.is_empty() {
+                eprintln!("push needs --addr");
+                2
+            } else {
+                match push(&addr, &dir) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        eprintln!("push failed: {e}");
                         1
                     }
                 }
@@ -1259,8 +1480,12 @@ mod tests {
         // List both peers, then converge in one pass.
         peers_add(client.to_str().unwrap(), &addr_a).unwrap();
         peers_add(client.to_str().unwrap(), &addr_b).unwrap();
-        let (ok, failed, fetched) = sync_loop(client.to_str().unwrap(), 30, true).expect("pass");
-        assert_eq!((ok, failed, fetched), (2, 0, 2));
+        let (ok, failed, transferred) =
+            sync_loop(client.to_str().unwrap(), 30, true).expect("pass");
+        assert_eq!((ok, failed), (2, 0));
+        // Pull a from A, pull b from B, then push a to B (it lacks it — the
+        // pass is bidirectional now). Transferred = 3.
+        assert_eq!(transferred, 3);
 
         // Both bodies landed locally.
         assert!(client.join(format!("{}.body", sha256_hex(body_a))).exists());
@@ -1276,8 +1501,289 @@ mod tests {
     #[test]
     fn sync_pass_empty_list_is_a_clean_noop() {
         let dir = mk_temp_dir("conv-none");
-        let (ok, failed, fetched) = sync_pass(dir.to_str().unwrap());
-        assert_eq!((ok, failed, fetched), (0, 0, 0));
+        let (ok, failed, transferred) = sync_pass(dir.to_str().unwrap());
+        assert_eq!((ok, failed, transferred), (0, 0, 0));
+    }
+
+    // --- push direction (Peer.PutObject) ---
+
+    #[test]
+    fn store_body_names_files_by_computed_hash() {
+        let dir = mk_temp_dir("store");
+        let d = dir.to_str().unwrap();
+        let cid = store_body(d, b"hash-named body").unwrap();
+        assert_eq!(cid, sha256_hex(b"hash-named body"));
+        assert_eq!(
+            fs::read(dir.join(format!("{cid}.body"))).unwrap(),
+            b"hash-named body"
+        );
+
+        // Re-storing the same bytes is a no-op (already present).
+        assert_eq!(store_body(d, b"hash-named body").unwrap(), cid);
+
+        // Empty bodies are rejected outright.
+        assert!(store_body(d, b"").is_err());
+
+        // Oversized bodies are rejected without touching the store.
+        let before = fs::read_dir(&dir).unwrap().count();
+        let big = vec![0u8; MAX_BODY_BYTES + 1];
+        assert!(store_body(d, &big).is_err());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), before);
+
+        // No temp files left behind.
+        assert!(!fs::read_dir(&dir).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".incoming-")));
+    }
+
+    #[test]
+    fn server_accepts_push_and_rejects_tampered_frames() {
+        // A push of a body whose sha256 != BLID must be rejected with a 400
+        // and must store NOTHING; a valid push stores under the true hash.
+        let (dir, cid) = fixture_dir(b"server-push body");
+        let blid = hex::decode(&cid).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let dirpath = dir.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut s = stream;
+            handle_client(&mut s, dirpath.to_str().unwrap());
+        });
+
+        let mut client = std::net::TcpStream::connect(&addr).unwrap();
+        let mut fake_blid = [0u8; 32];
+        fake_blid.copy_from_slice(&blid);
+
+        // 1. tampered: BLID does not match the body's real hash.
+        let req = p2p::cbor::message(
+            "Peer.PutObject",
+            1,
+            "",
+            putobject_request(&fake_blid, b"totally different bytes"),
+        );
+        p2p::write_frame(&mut client, &req).unwrap();
+        let m = p2p::decode_message(&p2p::read_frame(&mut client).unwrap()).unwrap();
+        assert!(
+            m.error.contains("400"),
+            "tampered push must be rejected, got: {}",
+            m.error
+        );
+
+        // 2. non-hex BODY (a CBOR text string, as a hostile peer would send).
+        let bogus = p2p::cbor::message("Peer.PutObject", 2, "", {
+            let mut out = p2p::cbor::map(2);
+            out.extend_from_slice(&p2p::cbor::kv("BLID", &p2p::cbor::hash32(&fake_blid)));
+            out.extend_from_slice(&p2p::cbor::kv("BODY", &p2p::cbor::text("not-hex-zz")));
+            out
+        });
+        p2p::write_frame(&mut client, &bogus).unwrap();
+        let m = p2p::decode_message(&p2p::read_frame(&mut client).unwrap()).unwrap();
+        assert!(m.error.contains("400"), "non-hex BODY must be rejected");
+
+        // 3. valid push of a NEW body lands under its computed hash.
+        let fresh = b"a brand new pushed body";
+        let fresh_cid = sha256_hex(fresh);
+        let mut fresh_blid = [0u8; 32];
+        fresh_blid.copy_from_slice(&hex::decode(&fresh_cid).unwrap());
+        let req = p2p::cbor::message(
+            "Peer.PutObject",
+            3,
+            "",
+            putobject_request(&fresh_blid, fresh),
+        );
+        p2p::write_frame(&mut client, &req).unwrap();
+        let m = p2p::decode_message(&p2p::read_frame(&mut client).unwrap()).unwrap();
+        assert_eq!(m.error, "");
+        assert_eq!(
+            m.payload.get("BLID").and_then(|v| v.as_str()),
+            Some(fresh_cid.as_str())
+        );
+        assert_eq!(
+            fs::read(dir.join(format!("{fresh_cid}.body"))).unwrap(),
+            fresh
+        );
+
+        // 4. re-pushing the same body is a clean no-op success.
+        let req = p2p::cbor::message(
+            "Peer.PutObject",
+            4,
+            "",
+            putobject_request(&fresh_blid, fresh),
+        );
+        p2p::write_frame(&mut client, &req).unwrap();
+        let m = p2p::decode_message(&p2p::read_frame(&mut client).unwrap()).unwrap();
+        assert_eq!(m.error, "");
+
+        // The tampered/garbage attempts stored nothing beyond the two valid bodies.
+        let bodies = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".body"))
+            .count();
+        assert_eq!(bodies, 2, "rejected pushes must not leave files");
+        drop(client);
+        server.join().unwrap();
+        let _ = cid;
+    }
+
+    #[test]
+    fn push_stream_ships_only_missing_bodies() {
+        // Server store starts with body A; client store holds A and B. The
+        // push must send only B, skip A (peer already has it), and the server
+        // store must end with both.
+        let body_a = b"push-already-there";
+        let body_b = b"push-the-missing-one";
+        let server_dir = mk_temp_dir("push-server");
+        let client_dir = mk_temp_dir("push-client");
+        fs::write(
+            server_dir.join(format!("{}.body", sha256_hex(body_a))),
+            body_a,
+        )
+        .unwrap();
+        for b in [body_a.as_slice(), body_b.as_slice()] {
+            fs::write(client_dir.join(format!("{}.body", sha256_hex(b))), b).unwrap();
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let dirpath = server_dir.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut s = stream;
+            handle_client(&mut s, dirpath.to_str().unwrap());
+        });
+
+        let mut client = std::net::TcpStream::connect(&addr).unwrap();
+        let (height, pushed, peer_had) =
+            push_stream(&mut client, client_dir.to_str().unwrap()).expect("push");
+        assert_eq!((height, pushed, peer_had), (1, 1, 1));
+        drop(client);
+        server.join().unwrap();
+
+        let stored = fs::read(server_dir.join(format!("{}.body", sha256_hex(body_b))));
+        assert_eq!(
+            stored.unwrap(),
+            body_b,
+            "missing body must land on the peer"
+        );
+    }
+
+    #[test]
+    fn bidirectional_pass_converges_two_stores() {
+        // The core guarantee: one pull+push pass over one socket per peer
+        // makes BOTH stores converge to the union, regardless of who starts
+        // with what.
+        let dir_a = mk_temp_dir("bidi-a");
+        let dir_b = mk_temp_dir("bidi-b");
+        let body_a = b"only a starts with this";
+        let body_b = b"only b starts with this";
+        fs::write(dir_a.join(format!("{}.body", sha256_hex(body_a))), body_a).unwrap();
+        fs::write(dir_b.join(format!("{}.body", sha256_hex(body_b))), body_b).unwrap();
+
+        let lsn_a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr_a = lsn_a.local_addr().unwrap().to_string();
+        let lsn_b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr_b = lsn_b.local_addr().unwrap().to_string();
+
+        // Server A pulls from B first (gets body_b), then B pulls from A —
+        // but by then B already pushed... this test just runs a full
+        // bidirectional pass from ONE side and verifies union convergence.
+        let dpa = dir_a.clone();
+        let dpb = dir_b.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = lsn_b.accept() {
+                handle_client(&mut s, dpb.to_str().unwrap());
+            }
+        });
+
+        // Client-side: store A syncs with B over one connection.
+        let mut s = std::net::TcpStream::connect(&addr_b).unwrap();
+        let (_, fetched, _) = sync_stream(&mut s, dir_a.to_str().unwrap()).expect("pull");
+        let (_, pushed, _) = push_stream(&mut s, dir_a.to_str().unwrap()).expect("push");
+        assert_eq!(fetched, 1, "A pulls B's body");
+        assert_eq!(pushed, 1, "A pushes its body to B");
+        drop(s);
+
+        // Both stores now hold the union.
+        for d in [&dir_a, &dir_b] {
+            assert!(
+                d.join(format!("{}.body", sha256_hex(body_a))).exists(),
+                "a in {d:?}"
+            );
+            assert!(
+                d.join(format!("{}.body", sha256_hex(body_b))).exists(),
+                "b in {d:?}"
+            );
+        }
+        let _ = (dpa, addr_a, lsn_a); // symmetric direction covered by sync-loop tests
+    }
+
+    #[test]
+    fn sync_loop_pass_is_bidirectional() {
+        // Two servers each holding one distinct body; the client store
+        // starts with a THIRD body. One --once pass must: pull both remote
+        // bodies into the client AND push the client's body out to BOTH
+        // servers. Final state: all three stores hold all three bodies.
+        let dir_a = mk_temp_dir("loop-a");
+        let dir_b = mk_temp_dir("loop-b");
+        let dir_c = mk_temp_dir("loop-c");
+        let body_a = b"lives on a";
+        let body_b = b"lives on b";
+        let body_c = b"lives on client";
+        fs::write(dir_a.join(format!("{}.body", sha256_hex(body_a))), body_a).unwrap();
+        fs::write(dir_b.join(format!("{}.body", sha256_hex(body_b))), body_b).unwrap();
+        fs::write(dir_c.join(format!("{}.body", sha256_hex(body_c))), body_c).unwrap();
+
+        let lsn_a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr_a = lsn_a.local_addr().unwrap().to_string();
+        let lsn_b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr_b = lsn_b.local_addr().unwrap().to_string();
+
+        // Each server serves TWO sequential connections (the pass pulls and
+        // pushes over ONE socket per peer, so why two? — the pull pass and
+        // push pass both run inside sync_pass on the same socket; two
+        // connections are only needed because the test re-checks after the
+        // pass via a second sync). Serve generously: 4 connections each.
+        for (lsn, d) in [(&lsn_a, &dir_a), (&lsn_b, &dir_b)] {
+            let lsn = lsn.try_clone().unwrap();
+            let d = d.clone();
+            std::thread::spawn(move || {
+                for _ in 0..4 {
+                    let (stream, _) = lsn.accept().unwrap();
+                    let mut s = stream;
+                    handle_client(&mut s, d.to_str().unwrap());
+                }
+            });
+        }
+
+        peers_add(dir_c.to_str().unwrap(), &addr_a).unwrap();
+        peers_add(dir_c.to_str().unwrap(), &addr_b).unwrap();
+        let (ok, failed, transferred) = sync_loop(dir_c.to_str().unwrap(), 30, true).expect("pass");
+        assert_eq!((ok, failed), (2, 0));
+        // Peer A: pull a (1) + push c (1). Peer B: pull b (1) + push a AND c
+        // (2) — B lacked both, including the body the client just pulled from
+        // A: one pass gives a transitive hop. Total transferred = 5.
+        assert_eq!(transferred, 5);
+
+        // One pass leaves A without b (nothing carried b to A yet — gossip is
+        // not transitive within a single pass in every topology). The loop is
+        // periodic precisely for this: pass two carries b to A.
+        let (ok, failed, transferred2) =
+            sync_loop(dir_c.to_str().unwrap(), 30, true).expect("pass 2");
+        assert_eq!((ok, failed), (2, 0));
+        assert_eq!(
+            transferred2, 1,
+            "second pass moves exactly one body: b to A"
+        );
+
+        // Union everywhere after two passes.
+        for d in [&dir_a, &dir_b, &dir_c] {
+            for b in [body_a.as_slice(), body_b.as_slice(), body_c.as_slice()] {
+                assert!(d.join(format!("{}.body", sha256_hex(b))).exists());
+            }
+        }
     }
 
     // Guard the fixture helper itself.
