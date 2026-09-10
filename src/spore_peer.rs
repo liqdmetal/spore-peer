@@ -33,11 +33,14 @@
 //!   spore-peer serve --listen 0.0.0.0:8099 --dir <body-store-dir>   (sender)
 //!   spore-peer fetch --addr host:8099 --cid <64-hex> [--out file]   (recipient)
 //!   spore-peer sync  --addr host:8099 --dir <body-store-dir>        (rpc2 sync subset)
+//!   spore-peer peers --dir <store> add|remove <host:port> | list    (peer list)
+//!   spore-peer sync-loop --dir <store> [--interval 30] [--once]     (converge from all peers)
 //!
 //! Request (over the frame): JSON {"cid": "<64-hex>"}, or an rpc2/CBOR map
 //! (Peer.Handshake / Peer.Chain / Peer.GetObject) on the same port.
 use std::fs;
 use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
 
 mod p2p;
 use p2p::{
@@ -136,8 +139,8 @@ fn chain_view(dir: &str) -> Vec<(u64, [u8; 32])> {
 }
 
 /// handle_rpc2 answers one rpc2 request (the DERO peer sync subset) using the
-/// body store as its ledger. Single request/response per connection, matching
-/// the cid-fetch protocol's shape.
+/// body store as its ledger. The caller loops per frame, so one connection
+/// serves many requests.
 fn handle_rpc2(s: &mut TcpStream, msg: &Rpc2Message, dir: &str) {
     match msg.method.as_str() {
         "Peer.Handshake" => {
@@ -372,10 +375,145 @@ fn sync(addr: &str, dir: &str) -> Result<(), String> {
     Ok(())
 }
 
+// --- multi-peer convergence (peers list + periodic sync loop) ---
+
+/// The peers list lives in the store dir as `peers.txt`: one `host:port` per
+/// line, `#` comments and blank lines ignored, deduplicated on write.
+fn peers_path(dir: &str) -> String {
+    format!("{dir}/peers.txt")
+}
+
+fn peers_list(dir: &str) -> Vec<String> {
+    let text = match fs::read_to_string(peers_path(dir)) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !out.iter().any(|p| p == line) {
+            out.push(line.to_string());
+        }
+    }
+    out
+}
+
+/// `host:port` shape check: non-empty host, numeric port 1..=65535, no
+/// whitespace or path characters. rsplit_once keeps raw IPv6 literals
+/// (`::1:8099`) and bracketed forms (`[::1]:8099`) working.
+fn validate_peer_addr(addr: &str) -> Result<(), String> {
+    if addr
+        .chars()
+        .any(|c| c.is_whitespace() || c == '/' || c == '\\')
+    {
+        return Err(format!(
+            "peer '{addr}': whitespace and path characters are not allowed"
+        ));
+    }
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return Err(format!("peer '{addr}': need host:port"));
+    };
+    if host.is_empty() {
+        return Err(format!("peer '{addr}': empty host"));
+    }
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("peer '{addr}': port must be numeric (1-65535)"))?;
+    if port == 0 {
+        return Err(format!("peer '{addr}': port 0 is not connectable"));
+    }
+    Ok(())
+}
+
+fn peers_write(dir: &str, list: &[String]) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("dir {dir}: {e}"))?;
+    let mut body = String::from("# spore-peer peers list: one host:port per line\n");
+    for p in list {
+        body.push_str(p);
+        body.push('\n');
+    }
+    fs::write(peers_path(dir), body).map_err(|e| e.to_string())
+}
+
+/// Returns Ok(true) if the peer was newly added, Ok(false) if already known.
+fn peers_add(dir: &str, addr: &str) -> Result<bool, String> {
+    validate_peer_addr(addr)?;
+    let mut list = peers_list(dir);
+    if list.iter().any(|p| p == addr) {
+        return Ok(false);
+    }
+    list.push(addr.to_string());
+    peers_write(dir, &list)?;
+    Ok(true)
+}
+
+/// Returns Ok(true) if the peer was removed, Ok(false) if it was not listed.
+fn peers_remove(dir: &str, addr: &str) -> Result<bool, String> {
+    let list = peers_list(dir);
+    let kept: Vec<String> = list
+        .iter()
+        .filter(|p| p.as_str() != addr)
+        .cloned()
+        .collect();
+    if kept.len() == list.len() {
+        return Ok(false);
+    }
+    peers_write(dir, &kept)?;
+    Ok(true)
+}
+
+/// One convergence pass: sync from every peer in the list. A dead or
+/// unreachable peer is logged and skipped, never fatal — convergence must
+/// not depend on every peer being online. Returns (ok, failed, fetched).
+fn sync_pass(dir: &str) -> (usize, usize, u64) {
+    let peers = peers_list(dir);
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    let mut fetched = 0u64;
+    for addr in &peers {
+        match TcpStream::connect(addr) {
+            Ok(mut s) => match sync_stream(&mut s, dir) {
+                Ok((_, f, _)) => {
+                    ok += 1;
+                    fetched += f as u64;
+                }
+                Err(e) => {
+                    eprintln!("sync-loop: {addr}: {e}");
+                    failed += 1;
+                }
+            },
+            Err(e) => {
+                eprintln!("sync-loop: {addr}: unreachable ({e})");
+                failed += 1;
+            }
+        }
+    }
+    (ok, failed, fetched)
+}
+
+/// Periodic convergence loop: one sync_pass every `interval` seconds, forever
+/// (or once, with `once`). Returns the last pass summary when running --once.
+fn sync_loop(dir: &str, interval: u64, once: bool) -> Result<(usize, usize, u64), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("dir {dir}: {e}"))?;
+    loop {
+        let (ok, failed, fetched) = sync_pass(dir);
+        eprintln!(
+            "sync-loop: pass done: {ok} peer(s) synced, {failed} failed, {fetched} body(ies) fetched"
+        );
+        if once {
+            return Ok((ok, failed, fetched));
+        }
+        std::thread::sleep(Duration::from_secs(interval));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: spore-peer <serve|fetch|sync> ...");
+        eprintln!("usage: spore-peer <serve|fetch|sync|peers|sync-loop> ...");
         std::process::exit(2);
     }
     let code = match args[1].as_str() {
@@ -466,6 +604,112 @@ fn main() {
                         eprintln!("sync failed: {e}");
                         1
                     }
+                }
+            }
+        }
+        "peers" => {
+            // peers --dir <store> add|remove <host:port> | list
+            let mut dir = ".".to_string();
+            let mut op = String::new();
+            let mut addr = String::new();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--dir" => {
+                        dir = args.get(i + 1).cloned().unwrap_or(dir);
+                        i += 2;
+                    }
+                    "add" | "remove" => {
+                        op = args[i].clone();
+                        addr = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "list" => {
+                        op = "list".to_string();
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            match op.as_str() {
+                "add" if !addr.is_empty() => match peers_add(&dir, &addr) {
+                    Ok(true) => {
+                        eprintln!("peer added: {addr}");
+                        0
+                    }
+                    Ok(false) => {
+                        eprintln!("peer already listed: {addr}");
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        1
+                    }
+                },
+                "remove" if !addr.is_empty() => match peers_remove(&dir, &addr) {
+                    Ok(true) => {
+                        eprintln!("peer removed: {addr}");
+                        0
+                    }
+                    Ok(false) => {
+                        eprintln!("peer not listed: {addr}");
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        1
+                    }
+                },
+                "list" => {
+                    let peers = peers_list(&dir);
+                    for p in &peers {
+                        println!("{p}");
+                    }
+                    eprintln!("{} peer(s) in {}", peers.len(), peers_path(&dir));
+                    0
+                }
+                _ => {
+                    eprintln!("peers needs: add <host:port> | remove <host:port> | list");
+                    2
+                }
+            }
+        }
+        "sync-loop" => {
+            let mut dir = ".".to_string();
+            let mut interval = 30u64;
+            let mut once = false;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--dir" => {
+                        dir = args.get(i + 1).cloned().unwrap_or(dir);
+                        i += 2;
+                    }
+                    "--interval" => {
+                        interval = args
+                            .get(i + 1)
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(interval);
+                        i += 2;
+                    }
+                    "--once" => {
+                        once = true;
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            match sync_loop(&dir, interval, once) {
+                Ok((_ok, failed, _)) => {
+                    if once && failed > 0 {
+                        1 // --once is scriptable: nonzero when any peer failed
+                    } else {
+                        0
+                    }
+                }
+                Err(e) => {
+                    eprintln!("sync-loop failed: {e}");
+                    1
                 }
             }
         }
@@ -916,6 +1160,122 @@ mod tests {
         assert_eq!(m.payload.as_array().unwrap().len(), 1);
         drop(client);
         server.join().unwrap();
+    }
+
+    // --- multi-peer convergence (peers list + sync-loop) ---
+
+    #[test]
+    fn peers_add_list_remove_dedupe_and_persist() {
+        let dir = mk_temp_dir("peers");
+        let d = dir.to_str().unwrap();
+        assert!(peers_list(d).is_empty(), "fresh store has no peers");
+
+        assert!(peers_add(d, "10.0.0.1:8099").unwrap());
+        assert!(
+            !peers_add(d, "10.0.0.1:8099").unwrap(),
+            "duplicate add is a no-op"
+        );
+        assert!(peers_add(d, "10.0.0.2:8099").unwrap());
+        assert_eq!(peers_list(d), vec!["10.0.0.1:8099", "10.0.0.2:8099"]);
+
+        // The list survives a fresh read (persistence via peers.txt).
+        let reread = peers_list(d);
+        assert_eq!(reread.len(), 2);
+
+        // Comments and blanks in a hand-edited file are ignored.
+        fs::write(
+            peers_path(d),
+            "# comment\n\n10.0.0.3:8099\n  10.0.0.4:8099  \n",
+        )
+        .unwrap();
+        assert_eq!(
+            peers_list(d),
+            vec!["10.0.0.3:8099", "10.0.0.4:8099"],
+            "trim + comment skip"
+        );
+
+        assert!(peers_remove(d, "10.0.0.3:8099").unwrap());
+        assert!(
+            !peers_remove(d, "10.0.0.3:8099").unwrap(),
+            "removing twice is a no-op"
+        );
+        assert_eq!(peers_list(d), vec!["10.0.0.4:8099"]);
+    }
+
+    #[test]
+    fn peers_reject_bad_addrs() {
+        let dir = mk_temp_dir("peers-bad");
+        let d = dir.to_str().unwrap();
+        assert!(peers_add(d, "no-port").is_err());
+        assert!(peers_add(d, "host:0").is_err(), "port 0 is not connectable");
+        assert!(peers_add(d, "host:99999").is_err());
+        assert!(peers_add(d, ":8099").is_err());
+        assert!(peers_add(d, "bad host:8099").is_err(), "no whitespace");
+        assert!(
+            peers_add(d, "../../etc:8099").is_err(),
+            "no path characters"
+        );
+        // These are VALID and must be accepted:
+        assert!(peers_add(d, "localhost:8099").unwrap());
+        assert!(peers_add(d, "::1:8099").unwrap(), "raw IPv6 literal");
+        assert!(peers_add(d, "[::1]:8099").unwrap(), "bracketed IPv6");
+    }
+
+    #[test]
+    fn sync_loop_once_converges_two_peers() {
+        // Two servers, one empty client. peers.txt lists both; a single
+        // --once pass must converge the client from both. Server A holds
+        // "from alpha", server B holds "from beta".
+        let dir_a = mk_temp_dir("conv-a");
+        let dir_b = mk_temp_dir("conv-b");
+        let client = mk_temp_dir("conv-client");
+
+        let body_a = b"from alpha";
+        let body_b = b"from beta";
+        fs::write(dir_a.join(format!("{}.body", sha256_hex(body_a))), body_a).unwrap();
+        fs::write(dir_b.join(format!("{}.body", sha256_hex(body_b))), body_b).unwrap();
+
+        let lsn_a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr_a = lsn_a.local_addr().unwrap().to_string();
+        let lsn_b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr_b = lsn_b.local_addr().unwrap().to_string();
+
+        // Each server serves two sequential connections: this pass and the
+        // post-add re-check later in the test.
+        for (lsn, d) in [(&lsn_a, &dir_a), (&lsn_b, &dir_b)] {
+            let lsn = lsn.try_clone().unwrap();
+            let d = d.clone();
+            std::thread::spawn(move || {
+                for _ in 0..2 {
+                    let (stream, _) = lsn.accept().unwrap();
+                    let mut s = stream;
+                    handle_client(&mut s, d.to_str().unwrap());
+                }
+            });
+        }
+
+        // List both peers, then converge in one pass.
+        peers_add(client.to_str().unwrap(), &addr_a).unwrap();
+        peers_add(client.to_str().unwrap(), &addr_b).unwrap();
+        let (ok, failed, fetched) = sync_loop(client.to_str().unwrap(), 30, true).expect("pass");
+        assert_eq!((ok, failed, fetched), (2, 0, 2));
+
+        // Both bodies landed locally.
+        assert!(client.join(format!("{}.body", sha256_hex(body_a))).exists());
+        assert!(client.join(format!("{}.body", sha256_hex(body_b))).exists());
+
+        // After adding a third peer, a pass fails exactly once (dead peer is
+        // skipped, live peers still converge).
+        peers_add(client.to_str().unwrap(), "127.0.0.1:1").unwrap();
+        let (ok, failed, _fetched) = sync_loop(client.to_str().unwrap(), 30, true).expect("pass 2");
+        assert_eq!((ok, failed), (2, 1), "dead peer must not break the pass");
+    }
+
+    #[test]
+    fn sync_pass_empty_list_is_a_clean_noop() {
+        let dir = mk_temp_dir("conv-none");
+        let (ok, failed, fetched) = sync_pass(dir.to_str().unwrap());
+        assert_eq!((ok, failed, fetched), (0, 0, 0));
     }
 
     // Guard the fixture helper itself.
