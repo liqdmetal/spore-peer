@@ -42,8 +42,19 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (--no-deps, deny warnings)
-        # Blocking since the backlog was drained (2026-09-09): the rpc2/CBOR
-        # port in p2p.rs is intentionally kept whole behind a module-scoped
-        # allow(dead_code) until the sync loop consumes it — the lint gate
-        # must not pressure anyone into sawing the protocol in half.
+        # Blocking lint gate. The rpc2/CBOR sync subset is wired into the live
+        # peer (Peer.Handshake/Chain/GetObject), so no module is exempt.
         run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+
+  fmt:
+    name: rustfmt (blocking gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        # Blocking: cargo fmt -- --check exits non-zero on any file rustfmt
+        # would rewrite. Backlog drained 2026-09-10.
+        run: cargo fmt -- --check
