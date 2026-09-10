@@ -45,7 +45,7 @@ const STATUS_OK: u8 = 0x00;
 const STATUS_ERR: u8 = 0x01;
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -502,7 +502,7 @@ mod tests {
         });
 
         let mut client = std::net::TcpStream::connect(&addr).unwrap();
-        let err = fetch_stream(&mut client, &cid, None).unwrap_err();
+        let err = fetch_stream(&mut client, cid, None).unwrap_err();
         assert!(err.contains("404"), "got: {err}");
         server.join().unwrap();
     }

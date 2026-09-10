@@ -12,6 +12,13 @@
 //! reference daemon on port 11010. We implement the client + server side
 //! of the sync subset so Rust nodes can exchange blocks directly.
 
+// The rpc2/CBOR codec below is a clean-room port of the reference daemon's
+// wire protocol, staged ahead of wiring Peer.Chain/GetObject into the live
+// sync loop. Both the encoder and decoder halves are kept complete and
+// symmetric on purpose; until the sync loop consumes them all, dead_code
+// is silenced here rather than sawing the protocol implementation in half.
+#![allow(dead_code)]
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
