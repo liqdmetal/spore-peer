@@ -21,9 +21,20 @@ Sender holds an encrypted body by CID (from `spore whisper send-long`):
 Recipient fetches it peer-to-peer:
     spore-peer fetch --addr <sender-host:port> --cid <64hex>
 
+Peers can also run the DERO rpc2 sync subset on the same port — one node
+exchanges its whole store with another in a single pass:
+    spore-peer sync --addr <peer-host:port> --dir <store-dir>
+
 Integrity is enforced both directions: a body whose sha256 != requested CID
 is rejected (`500 cid mismatch`), so a tampered or hostile peer can never
 hand you bytes you did not ask for.
+
+The rpc2 subset speaks the reference DERO wire protocol (clean-room): a CBOR
+header map `{M: method, S: seq, E: error}` followed by a CBOR payload item,
+with `Peer.Handshake`, `Peer.Chain` (topoheight/blid list — the body store is
+the ledger, ordered by mtime) and `Peer.GetObject` (sha256-verified body
+fetch). It coexists with the legacy JSON cid-fetch protocol per-frame on the
+same connection.
 
 ## License
 BSD-3-Clause. Standalone clean-room — the framing primitives are vendored in
