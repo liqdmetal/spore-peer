@@ -40,8 +40,10 @@
 //! Request (over the frame): JSON {"cid": "<64-hex>"}, or an rpc2/CBOR map
 //! (Peer.Handshake / Peer.Chain / Peer.GetObject / Peer.PutObject) on the
 //! same port.
+use std::collections::HashMap;
 use std::fs;
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 use std::time::Duration;
 
 // The wire codec lives in the library crate (src/p2p.rs) so benchmarks and
@@ -56,6 +58,119 @@ use spore_peer::p2p::{
 /// Largest body a peer may push into the local store (also the frame cap's
 /// practical limit: a push request carries BLID + BODY in one CBOR frame).
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Write-path policy for a serve node. Read paths (cid-fetch, GetObject,
+/// Chain) stay open; writes (PutObject) are gated here so a public node is
+/// not a disk-fill target for strangers.
+#[derive(Default, Clone)]
+struct ServeConfig {
+    /// Total bytes across *.body files; a PutObject that would exceed this
+    /// is refused (507). 0 = unlimited.
+    max_store_bytes: u64,
+    /// Max PutObject pushes per client IP per minute. 0 = unlimited.
+    put_rate: u32,
+    /// If set, every PutObject must carry TOKEN == this secret. Read paths
+    /// never need it. 0/None = no auth (content-addressed writes are safe
+    /// from poisoning, but not from disk fill).
+    token: Option<String>,
+}
+
+/// Fixed-window per-IP push counter. Bounded memory: stale windows are
+/// overwritten on the next hit from that IP, never accumulated.
+struct RateLimiter {
+    max: u32,
+    wins: std::sync::Mutex<HashMap<String, (u64, u32)>>,
+}
+
+impl RateLimiter {
+    fn new(max: u32) -> Self {
+        RateLimiter {
+            max,
+            wins: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+    fn allow(&self, ip: &str, now_sec: u64) -> bool {
+        if self.max == 0 {
+            return true;
+        }
+        let mut w = self.wins.lock().unwrap();
+        let e = w.entry(ip.to_string()).or_insert((now_sec, 0));
+        if e.0 != now_sec {
+            *e = (now_sec, 1);
+            return true;
+        }
+        if e.1 >= self.max {
+            return false;
+        }
+        e.1 += 1;
+        true
+    }
+}
+
+fn now_sec() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Constant-time-ish equality for the optional write token. Length is not
+/// secret, bytes are compared without early exit.
+fn ct_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut d = 0u8;
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        d |= x ^ y;
+    }
+    d == 0
+}
+
+/// Sum of *.body file bytes in the store (the quota baseline). O(n) per
+/// check; peer stores are small and pushes are rare — a full walk is fine.
+fn store_bytes(dir: &str) -> u64 {
+    let mut total = 0u64;
+    if let Ok(rd) = fs::read_dir(dir) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("body") {
+                if let Ok(md) = fs::metadata(&p) {
+                    total = total.saturating_add(md.len());
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Gate a PutObject against the serve policy: rate limit, store quota, and
+/// (optionally) the write token carried in the request payload.
+fn enforce_write_policy(
+    cfg: &ServeConfig,
+    ip: &str,
+    dir: &str,
+    body_len: usize,
+    limiter: &RateLimiter,
+    payload: &serde_json::Value,
+) -> Result<(), String> {
+    if !limiter.allow(ip, now_sec()) {
+        return Err("429 put rate limit exceeded".to_string());
+    }
+    if let Some(tok) = &cfg.token {
+        let given = payload.get("TOKEN").and_then(|v| v.as_str()).unwrap_or("");
+        if !ct_eq(given, tok) {
+            return Err("401 bad write token".to_string());
+        }
+    }
+    if cfg.max_store_bytes > 0 {
+        let used = store_bytes(dir);
+        if used.saturating_add(body_len as u64) > cfg.max_store_bytes {
+            return Err("507 store full".to_string());
+        }
+    }
+    Ok(())
+}
 
 /// store_body writes `body` into the store under the hash it COMPUTES, never
 /// under a caller-supplied name: the only way a file lands in the store is
@@ -182,7 +297,14 @@ fn chain_view(dir: &str) -> Vec<(u64, [u8; 32])> {
 /// handle_rpc2 answers one rpc2 request (the DERO peer sync subset) using the
 /// body store as its ledger. The caller loops per frame, so one connection
 /// serves many requests.
-fn handle_rpc2(s: &mut TcpStream, msg: &Rpc2Message, dir: &str) {
+fn handle_rpc2(
+    s: &mut TcpStream,
+    msg: &Rpc2Message,
+    dir: &str,
+    ip: &str,
+    cfg: &ServeConfig,
+    limiter: &RateLimiter,
+) {
     use sha2::{Digest, Sha256};
     match msg.method.as_str() {
         "Peer.Handshake" => {
@@ -256,6 +378,12 @@ fn handle_rpc2(s: &mut TcpStream, msg: &Rpc2Message, dir: &str) {
                 .get("BLID")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            // Write-policy gate: per-IP rate limit, optional write token, and
+            // the total-store quota. Read paths never pass through here.
+            if let Err(e) = enforce_write_policy(cfg, ip, dir, body.len(), limiter, &msg.payload) {
+                let _ = write_frame(s, &error_response(msg.seq, &e));
+                return;
+            }
             let mut h = Sha256::new();
             h.update(&body);
             let digest = h.finalize();
@@ -285,7 +413,13 @@ fn handle_rpc2(s: &mut TcpStream, msg: &Rpc2Message, dir: &str) {
     }
 }
 
-fn handle_client(s: &mut TcpStream, dir: &str) {
+fn handle_client(
+    s: &mut TcpStream,
+    dir: &str,
+    ip: String,
+    cfg: &ServeConfig,
+    limiter: &RateLimiter,
+) {
     // One connection, many requests: the rpc2 sync subset is persistent (the
     // reference keeps peer connections open), so a syncing client does
     // Handshake -> Chain -> GetObject... over a single socket. Legacy
@@ -303,7 +437,7 @@ fn handle_client(s: &mut TcpStream, dir: &str) {
         // frame never decodes as an rpc2 message and misdispatch is impossible.
         if let Some(msg) = decode_message(&body) {
             if !msg.method.is_empty() {
-                handle_rpc2(s, &msg, dir);
+                handle_rpc2(s, &msg, dir, &ip, cfg, limiter);
                 continue;
             }
         }
@@ -713,6 +847,7 @@ fn main() {
         "serve" => {
             let mut addr = "0.0.0.0:8099".to_string();
             let mut dir = ".".to_string();
+            let mut cfg = ServeConfig::default();
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -724,10 +859,26 @@ fn main() {
                         dir = args.get(i + 1).cloned().unwrap_or(dir);
                         i += 2;
                     }
+                    "--max-store-bytes" => {
+                        if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                            cfg.max_store_bytes = v;
+                        }
+                        i += 2;
+                    }
+                    "--put-rate" => {
+                        if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                            cfg.put_rate = v;
+                        }
+                        i += 2;
+                    }
+                    "--token" => {
+                        cfg.token = args.get(i + 1).cloned();
+                        i += 2;
+                    }
                     _ => i += 1,
                 }
             }
-            match serve(&addr, &dir) {
+            match serve(&addr, &dir, cfg) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("serve error: {e}");
@@ -944,14 +1095,22 @@ fn main() {
     std::process::exit(code);
 }
 
-fn serve(addr: &str, dir: &str) -> std::io::Result<()> {
+fn serve(addr: &str, dir: &str, cfg: ServeConfig) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    eprintln!("spore-peer serve: listening on {addr}, bodies in {dir}");
+    let limiter = Arc::new(RateLimiter::new(cfg.put_rate));
+    eprintln!("spore-peer serve: listening on {addr}, bodies in {dir} (max_store_bytes={} put_rate={}/min write_token={})",
+        cfg.max_store_bytes, cfg.put_rate, if cfg.token.is_some() { "set" } else { "off" });
     for stream in listener.incoming() {
         match stream {
             Ok(mut s) => {
                 let d = dir.to_string();
-                std::thread::spawn(move || handle_client(&mut s, &d));
+                let ip = s
+                    .peer_addr()
+                    .map(|a| a.ip().to_string())
+                    .unwrap_or_else(|_| "?".to_string());
+                let c = cfg.clone();
+                let l = Arc::clone(&limiter);
+                std::thread::spawn(move || handle_client(&mut s, &d, ip, &c, &l));
             }
             Err(e) => eprintln!("accept error: {e}"),
         }
@@ -1167,7 +1326,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut s = stream;
-            handle_client(&mut s, dirpath.to_str().unwrap());
+            handle_client(
+                &mut s,
+                dirpath.to_str().unwrap(),
+                "127.0.0.1".to_string(),
+                &ServeConfig::default(),
+                &RateLimiter::new(0),
+            );
         });
 
         let mut client = std::net::TcpStream::connect(&addr).unwrap();
@@ -1187,7 +1352,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut s = stream;
-            handle_client(&mut s, dirpath.to_str().unwrap());
+            handle_client(
+                &mut s,
+                dirpath.to_str().unwrap(),
+                "127.0.0.1".to_string(),
+                &ServeConfig::default(),
+                &RateLimiter::new(0),
+            );
         });
 
         let mut client = std::net::TcpStream::connect(&addr).unwrap();
@@ -1224,7 +1395,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut s = stream;
-            handle_client(&mut s, dirpath.to_str().unwrap());
+            handle_client(
+                &mut s,
+                dirpath.to_str().unwrap(),
+                "127.0.0.1".to_string(),
+                &ServeConfig::default(),
+                &RateLimiter::new(0),
+            );
         });
 
         let mut client = std::net::TcpStream::connect(&addr).unwrap();
@@ -1266,7 +1443,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut s = stream;
-            handle_client(&mut s, dirpath.to_str().unwrap());
+            handle_client(
+                &mut s,
+                dirpath.to_str().unwrap(),
+                "127.0.0.1".to_string(),
+                &ServeConfig::default(),
+                &RateLimiter::new(0),
+            );
         });
 
         let mut client = std::net::TcpStream::connect(&addr).unwrap();
@@ -1307,7 +1490,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut s = stream;
-            handle_client(&mut s, dirpath.to_str().unwrap());
+            handle_client(
+                &mut s,
+                dirpath.to_str().unwrap(),
+                "127.0.0.1".to_string(),
+                &ServeConfig::default(),
+                &RateLimiter::new(0),
+            );
         });
 
         let client_dir = mk_temp_dir("sync-client");
@@ -1341,7 +1530,13 @@ mod tests {
             for _ in 0..2 {
                 let (stream, _) = listener.accept().unwrap();
                 let mut s = stream;
-                handle_client(&mut s, dirpath.to_str().unwrap());
+                handle_client(
+                    &mut s,
+                    dirpath.to_str().unwrap(),
+                    "127.0.0.1".to_string(),
+                    &ServeConfig::default(),
+                    &RateLimiter::new(0),
+                );
             }
         });
 
@@ -1371,7 +1566,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut s = stream;
-            handle_client(&mut s, dirpath.to_str().unwrap());
+            handle_client(
+                &mut s,
+                dirpath.to_str().unwrap(),
+                "127.0.0.1".to_string(),
+                &ServeConfig::default(),
+                &RateLimiter::new(0),
+            );
         });
 
         let mut client = std::net::TcpStream::connect(&addr).unwrap();
@@ -1472,7 +1673,13 @@ mod tests {
                 for _ in 0..2 {
                     let (stream, _) = lsn.accept().unwrap();
                     let mut s = stream;
-                    handle_client(&mut s, d.to_str().unwrap());
+                    handle_client(
+                        &mut s,
+                        d.to_str().unwrap(),
+                        "127.0.0.1".to_string(),
+                        &ServeConfig::default(),
+                        &RateLimiter::new(0),
+                    );
                 }
             });
         }
@@ -1550,7 +1757,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut s = stream;
-            handle_client(&mut s, dirpath.to_str().unwrap());
+            handle_client(
+                &mut s,
+                dirpath.to_str().unwrap(),
+                "127.0.0.1".to_string(),
+                &ServeConfig::default(),
+                &RateLimiter::new(0),
+            );
         });
 
         let mut client = std::net::TcpStream::connect(&addr).unwrap();
@@ -1652,7 +1865,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut s = stream;
-            handle_client(&mut s, dirpath.to_str().unwrap());
+            handle_client(
+                &mut s,
+                dirpath.to_str().unwrap(),
+                "127.0.0.1".to_string(),
+                &ServeConfig::default(),
+                &RateLimiter::new(0),
+            );
         });
 
         let mut client = std::net::TcpStream::connect(&addr).unwrap();
@@ -1694,7 +1913,13 @@ mod tests {
         let dpb = dir_b.clone();
         std::thread::spawn(move || {
             if let Ok((mut s, _)) = lsn_b.accept() {
-                handle_client(&mut s, dpb.to_str().unwrap());
+                handle_client(
+                    &mut s,
+                    dpb.to_str().unwrap(),
+                    "127.0.0.1".to_string(),
+                    &ServeConfig::default(),
+                    &RateLimiter::new(0),
+                );
             }
         });
 
@@ -1753,7 +1978,13 @@ mod tests {
                 for _ in 0..4 {
                     let (stream, _) = lsn.accept().unwrap();
                     let mut s = stream;
-                    handle_client(&mut s, d.to_str().unwrap());
+                    handle_client(
+                        &mut s,
+                        d.to_str().unwrap(),
+                        "127.0.0.1".to_string(),
+                        &ServeConfig::default(),
+                        &RateLimiter::new(0),
+                    );
                 }
             });
         }
@@ -1798,5 +2029,74 @@ mod tests {
         f.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, b"probe");
         let _ = std::io::stdout().flush();
+    }
+
+    // ---- write-path hardening (ServeConfig / RateLimiter / store_bytes) ----
+
+    #[test]
+    fn store_bytes_counts_only_body_files() {
+        let (dir, cid) = fixture_dir(b"quota-probe");
+        let _ = std::fs::File::create(dir.join("noise.bin")).unwrap();
+        let used = store_bytes(dir.to_str().unwrap());
+        assert_eq!(used, 11, "only the .body file counts (probe = 11 bytes)");
+    }
+
+    #[test]
+    fn rate_limiter_blocks_after_max_per_window() {
+        let l = RateLimiter::new(2);
+        let now = 1000u64;
+        assert!(l.allow("1.2.3.4", now));
+        assert!(l.allow("1.2.3.4", now));
+        assert!(
+            !l.allow("1.2.3.4", now),
+            "third push in the same window must be refused"
+        );
+        // different IP is unaffected
+        assert!(l.allow("5.6.7.8", now));
+        // a new window resets the counter
+        assert!(l.allow("1.2.3.4", now + 61));
+    }
+
+    #[test]
+    fn enforce_write_policy_token_gate() {
+        let cfg = ServeConfig {
+            token: Some("s3cret".to_string()),
+            ..Default::default()
+        };
+        let lim = RateLimiter::new(0);
+        let (dir, _) = fixture_dir(b"tok");
+        let ok = serde_json::json!({"TOKEN": "s3cret"});
+        let bad = serde_json::json!({"TOKEN": "wrong"});
+        let none = serde_json::json!({"BLID": "aa"});
+        assert!(enforce_write_policy(&cfg, "ip", dir.to_str().unwrap(), 10, &lim, &ok).is_ok());
+        assert!(enforce_write_policy(&cfg, "ip", dir.to_str().unwrap(), 10, &lim, &bad).is_err());
+        assert!(enforce_write_policy(&cfg, "ip", dir.to_str().unwrap(), 10, &lim, &none).is_err());
+        // no token configured -> everything writes
+        let open = ServeConfig::default();
+        assert!(enforce_write_policy(&open, "ip", dir.to_str().unwrap(), 10, &lim, &none).is_ok());
+    }
+
+    #[test]
+    fn enforce_write_policy_store_quota() {
+        let cfg = ServeConfig {
+            max_store_bytes: 11,
+            ..Default::default()
+        }; // exactly the probe body
+        let lim = RateLimiter::new(0);
+        let (dir, _) = fixture_dir(b"quota-one");
+        let payload = serde_json::json!({});
+        assert!(enforce_write_policy(&cfg, "ip", dir.to_str().unwrap(), 0, &lim, &payload).is_ok());
+        // "quota-one" is 9 bytes on disk; a 3-byte push exceeds the 11-byte quota
+        assert!(
+            enforce_write_policy(&cfg, "ip", dir.to_str().unwrap(), 3, &lim, &payload).is_err()
+        );
+    }
+
+    #[test]
+    fn ct_eq_rejects_differing_lengths_and_bytes() {
+        assert!(ct_eq("abc", "abc"));
+        assert!(!ct_eq("abc", "abd"));
+        assert!(!ct_eq("abc", "abcd"));
+        assert!(!ct_eq("", "x"));
     }
 }
