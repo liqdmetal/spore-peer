@@ -602,7 +602,7 @@ fn sync(addr: &str, dir: &str) -> Result<(), String> {
 /// peer's chain and Peer.PutObject every LOCAL body the peer is missing,
 /// sha256-verified locally before sending (the server re-verifies anyway —
 /// we just refuse to ship garbage). Returns (peer_height, pushed, peer_had).
-fn push_stream(s: &mut TcpStream, dir: &str) -> Result<(u64, usize, usize), String> {
+fn push_stream(s: &mut TcpStream, dir: &str, token: &str) -> Result<(u64, usize, usize), String> {
     // 1. handshake: learn the peer's height (also proves it speaks rpc2).
     let hs = rpc2_call(s, "Peer.Handshake", 1, handshake_request(1)).map_err(|e| e.to_string())?;
     if !hs.error.is_empty() {
@@ -653,10 +653,16 @@ fn push_stream(s: &mut TcpStream, dir: &str) -> Result<(u64, usize, usize), Stri
             s,
             "Peer.PutObject",
             200 + attempted as u64,
-            putobject_request(&cid, &body),
+            putobject_request(&cid, &body, token),
         )
         .map_err(|e| e.to_string())?;
         if !resp.error.is_empty() {
+            if resp.error.contains("401") {
+                return Err(format!(
+                    "push: write token rejected by peer: {}",
+                    resp.error
+                ));
+            }
             eprintln!("push: topo {topo}: {}", resp.error);
             continue;
         }
@@ -678,10 +684,10 @@ fn push_stream(s: &mut TcpStream, dir: &str) -> Result<(u64, usize, usize), Stri
 }
 
 /// push runs one push pass against a single peer.
-fn push(addr: &str, dir: &str) -> Result<(), String> {
+fn push(addr: &str, dir: &str, token: &str) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| format!("dir {dir}: {e}"))?;
     let mut s = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
-    let (height, pushed, peer_had) = push_stream(&mut s, dir)?;
+    let (height, pushed, peer_had) = push_stream(&mut s, dir, token)?;
     eprintln!(
         "pushed to {addr}: peer height {height}, pushed {pushed}, peer already had {peer_had}"
     );
@@ -793,7 +799,7 @@ fn sync_pass(dir: &str) -> (usize, usize, u64) {
             Ok(mut s) => {
                 let pull = sync_stream(&mut s, dir);
                 let push = if pull.is_ok() {
-                    push_stream(&mut s, dir)
+                    push_stream(&mut s, dir, "")
                 } else {
                     Err("skipped (pull failed)".to_string())
                 };
@@ -954,6 +960,7 @@ fn main() {
         "push" => {
             let mut addr = String::new();
             let mut dir = ".".to_string();
+            let mut token = String::new();
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -965,6 +972,10 @@ fn main() {
                         dir = args.get(i + 1).cloned().unwrap_or(dir);
                         i += 2;
                     }
+                    "--token" => {
+                        token = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
                     _ => i += 1,
                 }
             }
@@ -972,7 +983,7 @@ fn main() {
                 eprintln!("push needs --addr");
                 2
             } else {
-                match push(&addr, &dir) {
+                match push(&addr, &dir, &token) {
                     Ok(()) => 0,
                     Err(e) => {
                         eprintln!("push failed: {e}");
@@ -1775,7 +1786,7 @@ mod tests {
             "Peer.PutObject",
             1,
             "",
-            putobject_request(&fake_blid, b"totally different bytes"),
+            putobject_request(&fake_blid, b"totally different bytes", ""),
         );
         p2p::write_frame(&mut client, &req).unwrap();
         let m = p2p::decode_message(&p2p::read_frame(&mut client).unwrap()).unwrap();
@@ -1805,7 +1816,7 @@ mod tests {
             "Peer.PutObject",
             3,
             "",
-            putobject_request(&fresh_blid, fresh),
+            putobject_request(&fresh_blid, fresh, ""),
         );
         p2p::write_frame(&mut client, &req).unwrap();
         let m = p2p::decode_message(&p2p::read_frame(&mut client).unwrap()).unwrap();
@@ -1824,7 +1835,7 @@ mod tests {
             "Peer.PutObject",
             4,
             "",
-            putobject_request(&fresh_blid, fresh),
+            putobject_request(&fresh_blid, fresh, ""),
         );
         p2p::write_frame(&mut client, &req).unwrap();
         let m = p2p::decode_message(&p2p::read_frame(&mut client).unwrap()).unwrap();
@@ -1876,7 +1887,7 @@ mod tests {
 
         let mut client = std::net::TcpStream::connect(&addr).unwrap();
         let (height, pushed, peer_had) =
-            push_stream(&mut client, client_dir.to_str().unwrap()).expect("push");
+            push_stream(&mut client, client_dir.to_str().unwrap(), "").expect("push");
         assert_eq!((height, pushed, peer_had), (1, 1, 1));
         drop(client);
         server.join().unwrap();
@@ -1926,7 +1937,7 @@ mod tests {
         // Client-side: store A syncs with B over one connection.
         let mut s = std::net::TcpStream::connect(&addr_b).unwrap();
         let (_, fetched, _) = sync_stream(&mut s, dir_a.to_str().unwrap()).expect("pull");
-        let (_, pushed, _) = push_stream(&mut s, dir_a.to_str().unwrap()).expect("push");
+        let (_, pushed, _) = push_stream(&mut s, dir_a.to_str().unwrap(), "").expect("push");
         assert_eq!(fetched, 1, "A pulls B's body");
         assert_eq!(pushed, 1, "A pushes its body to B");
         drop(s);

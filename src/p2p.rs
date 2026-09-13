@@ -345,10 +345,17 @@ pub fn getobject_response(body: &[u8]) -> Vec<u8> {
 /// Peer.PutObject request payload: {"BLID": 32-byte hash, "BODY": raw bytes}.
 /// The server recomputes sha256(BODY) and stores under the hash it COMPUTED,
 /// rejecting the object outright if it does not match BLID.
-pub fn putobject_request(blid: &[u8; 32], body: &[u8]) -> Vec<u8> {
-    let mut out = cbor::map(2);
+pub fn putobject_request(blid: &[u8; 32], body: &[u8], token: &str) -> Vec<u8> {
+    let mut n = 2;
+    if !token.is_empty() {
+        n += 1;
+    }
+    let mut out = cbor::map(n);
     out.extend_from_slice(&cbor::kv("BLID", &cbor::hash32(blid)));
     out.extend_from_slice(&cbor::kv("BODY", &cbor::bytes(body)));
+    if !token.is_empty() {
+        out.extend_from_slice(&cbor::kv("TOKEN", &cbor::text(token)));
+    }
     out
 }
 
@@ -418,7 +425,7 @@ mod tests {
     fn putobject_roundtrips_blid_and_body() {
         let blid = [7u8; 32];
         let body = b"pushed body bytes";
-        let frame = cbor::message("Peer.PutObject", 11, "", putobject_request(&blid, body));
+        let frame = cbor::message("Peer.PutObject", 11, "", putobject_request(&blid, body, ""));
         let m = decode_message(&frame).expect("decode");
         assert_eq!(m.method, "Peer.PutObject");
         assert_eq!(
