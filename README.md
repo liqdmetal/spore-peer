@@ -1,7 +1,6 @@
 # spore-peer (m³)
 
-P2P long-body transport for **Spore** (the no-relay multi-chain messenger, part of the Mycelium stack) (the no-relay multi-chain
-messenger). Clean-room, BSD-3. Standalone — no derohe dependency.
+P2P long-body transport for **mycelium** (the no-relay multi-chain messenger, part of the mycelium stack). Clean-room, BSD-3. Standalone — no derohe dependency.
 
 Long bodies never ride a chain block. The sender holds the ECDH-encrypted
 body on their own node and advertises only a pointer (whisper); the
@@ -16,7 +15,7 @@ both sides.
     cargo build --release
 
 ## Usage
-Sender holds an encrypted body by CID (from `spore whisper send-long`):
+Sender holds an encrypted body by CID (from `mycelium whisper send-long`):
     spore-peer serve --dir <outbox-dir>
 Recipient fetches it peer-to-peer:
     spore-peer fetch --addr <sender-host:port> --cid <64hex>
