@@ -2046,7 +2046,7 @@ mod tests {
 
     #[test]
     fn store_bytes_counts_only_body_files() {
-        let (dir, cid) = fixture_dir(b"quota-probe");
+        let (dir, _cid) = fixture_dir(b"quota-probe");
         let _ = std::fs::File::create(dir.join("noise.bin")).unwrap();
         let used = store_bytes(dir.to_str().unwrap());
         assert_eq!(used, 11, "only the .body file counts (probe = 11 bytes)");
