@@ -1211,30 +1211,84 @@ mod tests {
         out
     }
 
+    /// Locate spore/docs/interop-vectors.json relative to this crate. The
+    /// wire-contract CI job checks spore out at the runner workspace and
+    /// clones this crate BESIDE it (manifest = <workspace>/../spore-peer), so
+    /// spore's docs sit two levels up; local workspaces nest them differently
+    /// — hence the small set of candidate anchors.
+    fn vectors_path() -> std::path::PathBuf {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        for candidate in [
+            "../../spore/docs/interop-vectors.json", // local sibling layout
+            "../spore/docs/interop-vectors.json",    // contract CI: <ws>/spore/{spore-peer,spore}
+            "../../../spore/docs/interop-vectors.json", // deeper local layout
+            "../docs/interop-vectors.json",          // crate beside spore root
+        ] {
+            let p = std::path::Path::new(manifest).join(candidate);
+            if p.exists() {
+                return p;
+            }
+        }
+        panic!(
+            "interop-vectors.json not found relative to {manifest}; the spore \
+             repo must be checked out beside this crate (WIRE_SPEC §6)"
+        );
+    }
+
+    /// Load the golden vector file the way an independent implementation
+    /// would: from disk, no hardcoded expectations.
+    fn load_vectors() -> serde_json::Value {
+        let raw = std::fs::read_to_string(vectors_path()).expect("read interop-vectors.json");
+        serde_json::from_str(&raw).expect("parse interop-vectors.json")
+    }
+
+    /// A missing or non-string field is a broken vector file, and the failure
+    /// must name the field.
+    fn field<'a>(v: &'a serde_json::Value, section: &str, key: &str) -> &'a str {
+        v.get(section)
+            .and_then(|s| s.get(key))
+            .and_then(|k| k.as_str())
+            .unwrap_or_else(|| panic!("interop-vectors.json missing {section}.{key}"))
+    }
+
     #[test]
     fn spec_frame_vectors_match() {
-        // Golden vectors from spore/docs/interop-vectors.json. The body starts
-        // with ASCII '4' on purpose (audit H4: only the status byte and the
-        // sha256-vs-CID check may decide anything).
-        let body: [u8; 6] = [0x34, 0x34, 0x34, 0x34, 0xAB, 0xCD];
+        // Golden vectors, READ from spore/docs/interop-vectors.json (WIRE_SPEC
+        // §6: an implementation is conformant when it reproduces every
+        // expected_* byte-for-byte). The body starts with ASCII '4' on purpose
+        // (audit H4: only the status byte and the sha256-vs-CID check may
+        // decide anything). Covers the classic 404 plus the hardened Go
+        // server's 400 bad frame / 410 gone strings.
+        let v = load_vectors();
+        let body = hex::decode(field(&v, "spore_peer_frame", "body_hex")).unwrap();
+
         let mut ok_payload = Vec::with_capacity(1 + body.len());
         ok_payload.push(0x00u8);
         ok_payload.extend_from_slice(&body);
-        let ok_frame = frame(&ok_payload);
         assert_eq!(
-            hex::encode(&ok_frame),
-            "070000000034343434abcd",
+            hex::encode(frame(&ok_payload)),
+            field(&v, "spore_peer_frame", "expected_ok_frame"),
             "ok frame must match the wire spec vector"
         );
-        let mut err_payload = Vec::with_capacity(1 + 13);
-        err_payload.push(0x01u8);
-        err_payload.extend_from_slice(b"404 not found");
-        let err_frame = frame(&err_payload);
-        assert_eq!(
-            hex::encode(&err_frame),
-            "0e00000001343034206e6f7420666f756e64",
-            "err frame must match the wire spec vector"
-        );
+
+        for (text_key, frame_key, name) in [
+            ("expected_err_text", "expected_err_frame", "404 not found"),
+            (
+                "expected_bad_frame_text",
+                "expected_bad_frame",
+                "400 bad frame",
+            ),
+            ("expected_gone_text", "expected_gone_frame", "410 gone"),
+        ] {
+            let mut payload = Vec::with_capacity(1 + field(&v, "spore_peer_frame", text_key).len());
+            payload.push(0x01u8);
+            payload.extend_from_slice(field(&v, "spore_peer_frame", text_key).as_bytes());
+            assert_eq!(
+                hex::encode(frame(&payload)),
+                field(&v, "spore_peer_frame", frame_key),
+                "{name} frame must match the wire spec vector"
+            );
+        }
     }
 
     #[test]
@@ -1258,6 +1312,23 @@ mod tests {
         let err = frame(&err_payload);
         let e = parse_fetch_response(&err[4..], &"0".repeat(64)).unwrap_err();
         assert_eq!(e, "404 not found");
+
+        // The hardened Go server's additional strings must surface through
+        // the parser exactly as written (never reshaped, never sniffed):
+        // 400 bad frame and 410 gone, straight from the vector file.
+        let v = load_vectors();
+        for (frame_key, text_key) in [
+            ("expected_bad_frame", "expected_bad_frame_text"),
+            ("expected_gone_frame", "expected_gone_text"),
+        ] {
+            let f = hex::decode(field(&v, "spore_peer_frame", frame_key)).unwrap();
+            let e = parse_fetch_response(&f[4..], &"0".repeat(64)).unwrap_err();
+            assert_eq!(
+                e,
+                field(&v, "spore_peer_frame", text_key),
+                "parser must surface the spec error text verbatim"
+            );
+        }
     }
 
     // --- server side (serve_body + framing) ---
