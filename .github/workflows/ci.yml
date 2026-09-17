@@ -58,3 +58,29 @@ jobs:
         # Blocking: cargo fmt -- --check exits non-zero on any file rustfmt
         # would rewrite. Backlog drained 2026-09-10.
         run: cargo fmt -- --check
+
+  # Fire the other half of the wire contract: spore gates its peerstore
+  # against THIS commit via its spore-peer-contract.yml repository_dispatch,
+  # so a Rust change is proven against the Go side the moment it lands on
+  # main (WIRE_SPEC §5). The payload sha is informational — spore's
+  # dispatch concurrency keeps only the newest push in flight, and the
+  # workflow falls back to its audited pin if the payload is ever stale —
+  # so no merge-commit lookup dance: $GITHUB_SHA is the pushed tip on
+  # fast-forward pushes (the normal case) and the merge sha otherwise.
+  notify-spore:
+    name: dispatch spore wire-contract gate
+    needs: [test, clippy, fmt]
+    # Skipped on PRs — only main pushes gate the cross-repo contract.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: repository_dispatch -> liqdmetal/spore (spore-peer-push)
+        # SPORE_DISPATCH_TOKEN: a token with repo scope (Actions can only
+        # create check suites in the same repo otherwise).
+        env:
+          GH_TOKEN: ${{ secrets.SPORE_DISPATCH_TOKEN }}
+        run: |
+          gh api repos/liqdmetal/spore/dispatches \
+            -f event_type=spore-peer-push \
+            -f "client_payload[sha]=$GITHUB_SHA" \
+            -f "client_payload[ref]=$GITHUB_REF_NAME"
