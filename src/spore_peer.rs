@@ -222,6 +222,44 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 /// serve_body looks up, hashes, and returns the body for `cid_hex` from `dir`.
 /// Pure aside from the filesystem read, so the integrity rules are testable
 /// without sockets. Returns Err(ascii message) for 400/404/500 conditions.
+///
+/// # The hold layout (WIRE_SPEC §7 — the on-disk contract)
+///
+/// The directory this serve reads is the DiskStore hold shared with the Go
+/// implementations (`spore serve -dir`, `internal/store/diskstore.go`):
+///
+///     <cid hex>.body   raw ciphertext (sha256(body) MUST equal the cid bytes)
+///     <cid hex>.exp    unix-seconds deadline as decimal text — the floor of
+///                      the true deadline; the record every version reads
+///     <cid hex>.expms  unix-millis deadline as decimal text — optional
+///                      refinement written by current Go versions
+///
+/// What this implementation does with that contract:
+///
+/// - **Content addressing is the serve-side MUST**: the file name is the hex
+///   CID and sha256(body) == cid is re-verified before every OK answer
+///   (below, "500 cid mismatch") — a corrupted or planted file must never
+///   become "the message".
+/// - **Expiry records are the HOLDER's business, not this server's.** This
+///   implementation reads only `<cid hex>.body` and never consults `.exp` /
+///   `.expms`: read-time enforcement (§5 `410 gone`) and background
+///   composting (`spore serve -reap-every`) belong to the Go holder, which
+///   owns the burn deadline it issued. A Rust-served hold therefore serves
+///   bodies until the holder deletes them — the §7 division of labor, not
+///   an omission: the alternative (guessing a TTL this binary was never
+///   given) could serve past a burn deadline, which the layout forbids.
+/// - **Unknown sibling files are invisible by construction**: lookups
+///   address exactly `<dir>/<64 hex>.body` (no traversal, no globbing), so
+///   `.exp` / `.expms` records — including the ms refinement an older build
+///   would not know — can never be confused for bodies or misread.
+/// - **Crash ordering is the writer's guarantee, respected here**: an
+///   expiry record is always written BEFORE its body (temp+rename, §7), so
+///   a body present on disk always has its deadline already recorded; and a
+///   dangling expiry file with no body reads as `404 not found`, which the
+///   direct-path miss below produces naturally.
+/// - **Hygiene mirror**: Go writes 0600 files in a 0700 directory; this
+///   serve only reads — it never widens permissions, creates, or removes
+///   hold files. Delete and reap remain the holder's operations.
 fn serve_body(dir: &str, cid_hex: &str) -> Result<Vec<u8>, String> {
     let raw = match hex_decode(cid_hex) {
         Some(r) if r.len() == 32 => r,
@@ -1140,6 +1178,10 @@ fn main() {
     std::process::exit(code);
 }
 
+/// serve binds and answers requests one-per-connection. `dir` is the hold
+/// laid out per WIRE_SPEC §7 — see serve_body for this implementation's
+/// reading of that on-disk contract (it serves `<cid>.body` only; expiry
+/// records are the holder's business).
 fn serve(addr: &str, dir: &str, cfg: ServeConfig) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     let limiter = Arc::new(RateLimiter::new(cfg.put_rate));
