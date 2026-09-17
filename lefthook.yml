@@ -1,0 +1,11 @@
+# lefthook — pre-push runs this crate's gates in CONTRIBUTING.md order:
+# build, fmt (blocking), clippy -D warnings (blocking), test. A failed gate
+# blocks the push. The Go-side -race + cross-binary interop run is exercised
+# from the spore repo (scripts/gates.sh builds this crate and drives the
+# interop both directions).
+#
+# Escape hatches: LEFTHOOK=0 git push ...   or   git push --no-verify
+pre-push:
+  commands:
+    gates:
+      run: cargo build --locked && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked
