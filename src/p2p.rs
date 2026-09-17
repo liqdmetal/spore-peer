@@ -29,7 +29,11 @@ pub fn read_frame(r: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len == 0 || len > 64 * 1024 * 1024 {
+    // 64 MiB payload cap... adjusted to 192 MiB: a Peer.PutObject carries
+    // BODY hex-encoded, so a max-size (32 MiB) body needs a 2*MAX_BODY_BYTES
+    // frame. The cap must exceed the wire size of any body the protocol
+    // permits, or legal pushes get misread as hostile lengths.
+    if len == 0 || len > 192 * 1024 * 1024 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "bad frame length",

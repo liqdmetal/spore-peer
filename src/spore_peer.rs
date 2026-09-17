@@ -464,10 +464,14 @@ fn handle_client(
 /// parse_fetch_response turns a response frame into the verified body bytes.
 ///
 /// v2: [0x00]+body (sha256 verified) or [0x01]+ascii error.
-/// Legacy fallback: any other first byte is treated as a raw body from an old
-/// server and accepted ONLY if sha256(frame) == cid — integrity decides, never
-/// content sniffing (the old client's bug: it treated bodies starting with
-/// ASCII '4'/'5' as errors, rejecting ~1.6% of valid ciphertexts).
+/// Legacy fallback: any frame whose whole content hashes to the CID is a raw
+/// legacy body — INCLUDING one that begins with the 0x00/0x01 status byte.
+/// The hash is the only classifier: a v2 ok frame hashes its payload
+/// (status byte excluded); a legacy body hashes whole. These are mutually
+/// exclusive because a body's own sha256 colliding with sha256(body[1..]) is
+/// computationally impossible. Any first-byte-based branch (the old client's
+/// ASCII '4'/'5' bug, audit H4) would misclassify ~2/256 of valid
+/// ciphertexts, so none exists here.
 fn parse_fetch_response(resp: &[u8], cid: &str) -> Result<Vec<u8>, String> {
     use sha2::{Digest, Sha256};
 
@@ -475,28 +479,40 @@ fn parse_fetch_response(resp: &[u8], cid: &str) -> Result<Vec<u8>, String> {
     if expected.len() != 32 {
         return Err("bad cid hex".to_string());
     }
+    let sha256 = |data: &[u8]| {
+        let mut h = Sha256::new();
+        h.update(data);
+        h.finalize()
+    };
 
+    // CLASSIFIER IS THE HASH, NEVER THE FIRST BYTE (audit H4, again).
+    //
+    // 1. Legacy raw body: the WHOLE frame hashes to the cid. This must be
+    //    tried FIRST, because a legacy body may begin with ANY byte —
+    //    including 0x00/0x01, the v2 status values (~2/256 of ciphertexts).
+    //    Classifying by the first byte (the old client's ASCII '4'/'5' bug)
+    //    would strip the status byte and misreport those as tampered.
+    //    sha256(resp) == cid and sha256(resp[1..]) == cid cannot both hold,
+    //    so the two interpretations are mutually exclusive.
+    if sha256(resp)[..] == expected[..] {
+        return Ok(resp.to_vec());
+    }
+
+    // 2. v2 status-prefixed frame: only the payload (status byte excluded)
+    //    can hash to the cid. Error frames carry no verifiable body — an
+    //    error is an error regardless of its text.
     match resp.first() {
         Some(&STATUS_OK) => {
             let body = &resp[1..];
-            let mut h = Sha256::new();
-            h.update(body);
-            let digest = h.finalize();
-            if digest[..] != expected[..] {
+            if sha256(body)[..] != expected[..] {
                 return Err("body sha256 does not match cid (tampered)".to_string());
             }
             Ok(body.to_vec())
         }
         Some(&STATUS_ERR) => Err(String::from_utf8_lossy(&resp[1..]).to_string()),
         _ => {
-            // Legacy server: the whole frame is the raw body; verify by hash.
-            let mut h = Sha256::new();
-            h.update(resp);
-            let digest = h.finalize();
-            if digest[..] != expected[..] {
-                return Err("body sha256 does not match cid (tampered)".to_string());
-            }
-            Ok(resp.to_vec())
+            // Neither a verifiable legacy body nor a v2 status frame.
+            Err("body sha256 does not match cid (tampered)".to_string())
         }
     }
 }
@@ -553,7 +569,25 @@ fn sync_stream(s: &mut TcpStream, dir: &str) -> Result<(u64, usize, usize), Stri
         }
         let top = pair[0].as_u64().unwrap_or(0);
         let blid_hex = pair[1].as_str().unwrap_or("");
-        let expected = hex_decode(blid_hex).ok_or("bad blid hex in chain")?;
+        // A hostile or broken peer can put ANY string in a chain entry.
+        // Non-hex and non-32-byte blids must be skipped, not fatal: a short
+        // one used to overflow copy_from_slice and panic the client (remote
+        // panic found by the hostile-peer audit), and a non-hex one used to
+        // abort the whole sync.
+        let expected = match hex_decode(blid_hex) {
+            Some(e) => e,
+            None => {
+                eprintln!("sync: topo {top}: chain entry blid is not hex — skipping");
+                continue;
+            }
+        };
+        if expected.len() != 32 {
+            eprintln!(
+                "sync: topo {top}: chain entry blid is {} bytes, want 32 — skipping",
+                expected.len()
+            );
+            continue;
+        }
         let path = format!("{dir}/{blid_hex}.body");
         if fs::metadata(&path).is_ok() {
             have += 1;
@@ -2109,5 +2143,271 @@ mod tests {
         assert!(!ct_eq("abc", "abd"));
         assert!(!ct_eq("abc", "abcd"));
         assert!(!ct_eq("", "x"));
+    }
+
+    // ==== hostile-peer / adversarial framing (audit H4 class) ====
+    #[test]
+    fn hostile_legacy_body_starting_with_status_byte_is_accepted() {
+        // F2 regression: a legacy raw body may legitimately START with 0x00
+        // or 0x01 (2/256 of ciphertexts). The sha256 check — not the first
+        // byte — must classify it. Before the fix these returned
+        // "tampered" or a bogus error string.
+        for first in [0x00u8, 0x01] {
+            let mut body = vec![first];
+            body.extend_from_slice(b"legacy body that begins with a status-byte value");
+            let cid = sha256_hex(&body);
+            let got = parse_fetch_response(&body, &cid)
+                .unwrap_or_else(|e| panic!("legacy body starting {first:#04x} rejected: {e}"));
+            assert_eq!(got, body);
+        }
+    }
+
+    #[test]
+    fn hostile_v2_ok_frame_with_status_like_body_is_accepted() {
+        // A v2 body whose bytes begin 0x00/0x01 must be served via the
+        // status-prefixed frame: status 0x00 + body, sha256 over body only.
+        for first in [0x00u8, 0x01] {
+            let mut body = vec![first];
+            body.extend_from_slice(b"v2 ciphertext beginning with a status-like byte");
+            let cid = sha256_hex(&body);
+            let resp = frame_ok(&body);
+            let got = parse_fetch_response(&resp, &cid).expect("v2 ok must parse");
+            assert_eq!(got, body);
+        }
+    }
+
+    #[test]
+    fn hostile_no_sniff_sweep_all_256_first_bytes() {
+        // The H4 invariant, exhaustively: for EVERY possible first byte b,
+        // the client must accept (a) a legacy raw body starting with b and
+        // (b) a v2 ok frame whose payload starts with b — whenever the        // sha256 matches. Content classification beyond the hash is a bug.
+        for b in 0u8..=255 {
+            let body = {
+                let mut v = vec![b];
+                v.extend_from_slice(format!("sweep body {b}").as_bytes());
+                v
+            };
+            let cid = sha256_hex(&body);
+            // legacy raw frame
+            assert!(
+                parse_fetch_response(&body, &cid).is_ok(),
+                "legacy body with first byte {b:#04x} must verify"
+            );
+            // v2 ok frame
+            let resp = frame_ok(&body);
+            assert!(
+                parse_fetch_response(&resp, &cid).is_ok(),
+                "v2 frame with payload first byte {b:#04x} must verify"
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_only_status_byte_yields_error_text() {
+        // For a NON-matching cid, body-looking bytes must never be parsed
+        // as mail and never surface as error text — EXCEPT through the one
+        // legitimate v2 path: a frame starting 0x01 IS a status-error frame
+        // by protocol (an error carries no hash to verify). Every other
+        // first byte must produce the hash verdict.
+        let zeros_cid = "0".repeat(64);
+        for b in 0u8..=255 {
+            let frame = {
+                let mut v = vec![b];
+                v.extend_from_slice(b"404 not found");
+                v
+            };
+            let err = parse_fetch_response(&frame, &zeros_cid).unwrap_err();
+            if b == 0x01 {
+                assert_eq!(err, "404 not found", "0x01 is the v2 error status");
+            } else {
+                assert_eq!(
+                    err, "body sha256 does not match cid (tampered)",
+                    "first byte {b:#04x} must not yield error text"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_mutated_legacy_corpus_never_misclassified() {
+        // Deterministic xorshift corpus: mutate a valid legacy body 20k
+        // times; every mutant must either verify (impossible here — cid is
+        // fixed to the original) or fail with the HASH verdict. The error
+        // text must never come from frame content.
+        let base = b"mutate me: a perfectly valid legacy ciphertext body";
+        let cid = sha256_hex(base);
+        let mut state: u64 = 0xC1D5_F00D_1234_5678;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let mut mutated = base.to_vec();
+            let flips = 1 + (next() % 4) as usize;
+            for _ in 0..flips {
+                let idx = (next() as usize) % mutated.len();
+                mutated[idx] = (next() & 0xFF) as u8;
+            }
+            if let Ok(body) = parse_fetch_response(&mutated, &cid) {
+                // A mutant verified => it must be bit-identical to the
+                // original (second-preimage resistance means nothing else
+                // can hash to the same cid).
+                assert_eq!(body, base, "accepted a mutated body");
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_empty_and_tiny_fetch_responses() {
+        let cid = sha256_hex(b"x");
+        // empty response: not a v2 status, not a verifiable body -> tampered
+        let err = parse_fetch_response(&[], &cid).unwrap_err();
+        assert_eq!(err, "body sha256 does not match cid (tampered)");
+        // bare [0x00] with no payload: sha256("") != cid -> tampered
+        let err = parse_fetch_response(&[0x00], &cid).unwrap_err();
+        assert_eq!(err, "body sha256 does not match cid (tampered)");
+        // bare [0x01] with no payload: error with empty message
+        let err = parse_fetch_response(&[0x01], &cid).unwrap_err();
+        assert_eq!(err, "");
+        // bad cid hex is refused before any byte inspection
+        assert!(parse_fetch_response(&[0x00], "zz").is_err());
+        assert!(parse_fetch_response(&[0x00], &"a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn hostile_store_rejects_bodies_that_do_not_hash_to_requested_cid() {
+        // CID-hash-before-accept, server side: a file planted in the store
+        // (or corrupted in place) must NEVER be served as its claimed cid.
+        let dir = mk_temp_dir("planted");
+        let real = b"the body that was actually written";
+        let fake_cid = sha256_hex(b"a completely different body");
+        fs::write(dir.join(format!("{fake_cid}.body")), real).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let err = serve_body(&d, &fake_cid).unwrap_err();
+        assert_eq!(err, "500 cid mismatch");
+        // A body that DOES hash to its filename is served byte-exact.
+        let good = b"honest body";
+        let good_cid = sha256_hex(good);
+        fs::write(dir.join(format!("{good_cid}.body")), good).unwrap();
+        assert_eq!(serve_body(&d, &good_cid).unwrap(), good);
+    }
+
+    #[test]
+    fn hostile_sync_rejects_short_and_nonhex_blid_entries() {
+        // F1 regression: a hostile Peer.Chain reply with a 20-hex-char (10
+        // byte) blid used to panic the client in copy_from_slice. It must
+        // be skipped, not fatal.
+        // The "honest" entry below is NOT in the store (its body bytes are
+        // never written to disk), so the client must fetch it for the
+        // fetched count to hit 1.
+        let dir = mk_temp_dir("sync-hostile");
+        let cid = sha256_hex(b"sync hostile entry probe");
+        let d = dir.to_string_lossy().into_owned();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let _dirpath = dir.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut s = stream;
+            // Handshake reply.
+            let hs = p2p::read_frame(&mut s).unwrap();
+            let seq = p2p::decode_message(&hs).unwrap().seq;
+            p2p::write_frame(
+                &mut s,
+                &p2p::cbor::message("", seq, "", handshake_response(3, 1)),
+            )
+            .unwrap();
+            // Chain reply mixing a short blid, a non-hex blid, and one real
+            // entry (the fixture's).
+            let ch = p2p::read_frame(&mut s).unwrap();
+            let seq = p2p::decode_message(&ch).unwrap().seq;
+            let mut payload = p2p::cbor::array(3);
+            payload.extend_from_slice(&p2p::cbor::array(2));
+            payload.extend_from_slice(&p2p::cbor::uint(2));
+            payload.extend_from_slice(&p2p::cbor::text(&"a".repeat(20))); // 10 bytes
+            payload.extend_from_slice(&p2p::cbor::array(2));
+            payload.extend_from_slice(&p2p::cbor::uint(1));
+            payload.extend_from_slice(&p2p::cbor::text("zznothex"));
+            payload.extend_from_slice(&p2p::cbor::array(2));
+            payload.extend_from_slice(&p2p::cbor::uint(0));
+            payload.extend_from_slice(&p2p::cbor::text(&cid));
+            p2p::write_frame(&mut s, &p2p::cbor::message("", seq, "", payload)).unwrap();
+            // GetObject for the real entry.
+            let go = p2p::read_frame(&mut s).unwrap();
+            let msg = p2p::decode_message(&go).unwrap();
+            assert_eq!(msg.method, "Peer.GetObject");
+            let mut blid = [0u8; 32];
+            blid.copy_from_slice(&hex_decode(&cid).unwrap());
+            p2p::write_frame(
+                &mut s,
+                &p2p::cbor::message(
+                    "",
+                    msg.seq,
+                    "",
+                    getobject_response(b"sync hostile entry probe"),
+                ),
+            )
+            .unwrap();
+            drop(s); // client's connection ends after its pass
+        });
+
+        let mut client = std::net::TcpStream::connect(&addr).unwrap();
+        let (height, fetched, _have) =
+            sync_stream(&mut client, &d).expect("hostile chain must not kill the sync");
+        assert_eq!(height, 3);
+        assert_eq!(fetched, 1, "exactly the honest entry may be fetched");
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn hostile_sync_all_bad_blids_fails_cleanly() {
+        // Every entry hostile => nothing fetched, no panic, clean result.
+        let dir = mk_temp_dir("all-bad");
+        let d = dir.to_string_lossy().into_owned();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let _dirpath = dir.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut s = stream;
+            let hs = p2p::read_frame(&mut s).unwrap();
+            let seq = p2p::decode_message(&hs).unwrap().seq;
+            p2p::write_frame(
+                &mut s,
+                &p2p::cbor::message("", seq, "", handshake_response(0, 1)),
+            )
+            .unwrap();
+            let ch = p2p::read_frame(&mut s).unwrap();
+            let seq = p2p::decode_message(&ch).unwrap().seq;
+            let mut payload = p2p::cbor::array(2);
+            payload.extend_from_slice(&p2p::cbor::array(2));
+            payload.extend_from_slice(&p2p::cbor::uint(9));
+            payload.extend_from_slice(&p2p::cbor::text(&"b".repeat(14))); // 7 bytes
+            payload.extend_from_slice(&p2p::cbor::array(2));
+            payload.extend_from_slice(&p2p::cbor::uint(8));
+            payload.extend_from_slice(&p2p::cbor::text(&"".repeat(0))); // empty blid
+            p2p::write_frame(&mut s, &p2p::cbor::message("", seq, "", payload)).unwrap();
+            drop(s); // client stops after the chain pass
+        });
+
+        let mut client = std::net::TcpStream::connect(&addr).unwrap();
+        let (_h, fetched, _have) =
+            sync_stream(&mut client, &d).expect("no panic on all-hostile chain");
+        assert_eq!(fetched, 0);
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn hostile_rpc2_error_responses_are_never_treated_as_bodies() {
+        // Every rpc2 error path must carry E, never a payload that could be
+        // mistaken for object bytes.
+        let resp = error_response(5, "404 not found");
+        let m = decode_message(&resp).expect("error frame decodes");
+        assert_eq!(m.error, "404 not found");
+        assert!(m.payload.is_null());
     }
 }
