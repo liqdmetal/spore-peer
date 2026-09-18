@@ -187,6 +187,9 @@ pub struct FabricConfig {
     pub max_lease_sec: u64,
     /// fput per-IP per-second rate (the body path's window shape).
     pub fput_rate: u32,
+    /// Registry budget: max LIVE freg registrations. freg is
+    /// unauthenticated, so memory — not just rate — needs a hard ceiling.
+    pub max_regs: usize,
 }
 
 impl Default for FabricConfig {
@@ -196,6 +199,7 @@ impl Default for FabricConfig {
             max_per_handle: 32,
             max_lease_sec: 7 * 24 * 3600,
             fput_rate: 60,
+            max_regs: 50_000,
         }
     }
 }
@@ -249,6 +253,13 @@ impl FabricState {
                 let name = p.file_name().unwrap().to_string_lossy().to_string();
                 let env_cid_hex = name.trim_end_matches(".fenv").to_string();
                 let deadline = u64::from_le_bytes(env.pointer[66..74].try_into().unwrap());
+                if deadline <= now_sec() {
+                    // Envelope expired while the node was down: the burn
+                    // deadline has passed, so the pointer is worthless to the
+                    // recipient — compost instead of re-indexing.
+                    let _ = std::fs::remove_file(&p);
+                    continue;
+                }
                 queues
                     .entry(hex::encode(env.handle))
                     .or_default()
@@ -299,20 +310,37 @@ pub fn handle_verb(
     match req.get("verb").and_then(|v| v.as_str()) {
         Some("freg") => freg(s, st, req),
         Some("fput") => fput(s, st, req, dir, ip),
-        Some("fpop") => fpop(s, st, req, dir),
+        Some("fpop") => fpop(s, st, req, dir, ip),
         _ => {
             let _ = write_frame(s, &frame_err("400 bad fabric verb"));
         }
     }
 }
 
-/// freg {handle, token, nonce, lease} → 0x00 {token, expires}
+/// freg {handle, token, prev_token?, lease?} → 0x00 {token, expires}
 ///
 /// Registers/refreshes a handle with the owner's possession token. The relay
-/// cannot verify the token (it holds no seed) — it enforces possession by
-/// requiring it back at fpop; a squatter without the seed is evicted the
-/// moment the owner refreshes, and availability is the fabric's declared
-/// weak point. Lease capped at min(requested, max_lease).
+/// cannot verify the token against a seed (it holds none) — possession is
+/// enforced by requiring the token back at fpop. Two adversarial gates make
+/// the registry unattractive to abuse (F1 adversarial review):
+///
+/// 1. CHAINED REFRESH: overwriting a LIVE registration requires prev_token
+///    to match the current registration's token — only the seed holder can
+///    renew or rotate. Without this, any third party who learns the (public)
+///    handle could re-register it under their own token and drain the
+///    victim's queue. An EXPIRED registration is fair game again (it has
+///    become a squatter target exactly like a fresh handle).
+///
+/// 2. BUDGET + SWEEP: `max_regs` caps live registrations (default 50_000,
+///    per the body store's quota shape). A full budget of live entries →
+///    503: freg is unauthenticated, so the cap — not memory growth — is the
+///    DoS answer. New registrations evict nothing of others.
+///
+/// Token shape: 16..=128 bytes. The floor closes an auth bypass — fpop
+/// defaults a missing token to "", so an empty/1-char token would make the
+/// queue drainable by anyone; the ceiling bounds registry memory per entry.
+/// Handles are normalized to lowercase hex before use (hex case is not
+/// identity; the mixed-case variant must not split into a second slot).
 fn freg(s: &mut std::net::TcpStream, st: &FabricState, req: &serde_json::Value) {
     let Some(h) = req.get("handle").and_then(|v| v.as_str()) else {
         let _ = write_frame(s, &frame_err("400 freg needs handle"));
@@ -322,19 +350,41 @@ fn freg(s: &mut std::net::TcpStream, st: &FabricState, req: &serde_json::Value) 
         let _ = write_frame(s, &frame_err("400 handle must be 32-byte hex"));
         return;
     }
+    let h = h.to_lowercase();
     let Some(token) = req.get("token").and_then(|v| v.as_str()) else {
         let _ = write_frame(s, &frame_err("400 freg needs token"));
         return;
     };
+    if !(16..=128).contains(&token.len()) {
+        let _ = write_frame(s, &frame_err("400 token must be 16..=128 bytes"));
+        return;
+    }
+    let now = now_sec();
     let lease = req.get("lease").and_then(|v| v.as_u64()).unwrap_or(3600);
-    let expires = now_sec() + lease.min(st.cfg.max_lease_sec);
-    st.reg.lock().unwrap().insert(
-        h.to_string(),
+    let expires = now + lease.min(st.cfg.max_lease_sec);
+    let mut reg = st.reg.lock().unwrap();
+    reg.retain(|_, r| r.expires > now); // expired entries hold nothing but memory
+    if let Some(cur) = reg.get(&h) {
+        // LIVE registration: only the current token holder may renew/rotate.
+        let prev = req.get("prev_token").and_then(|v| v.as_str()).unwrap_or("");
+        if !ct_eq(&cur.token, prev) {
+            let _ = write_frame(s, &frame_err("403 live registration: prev_token required"));
+            return;
+        }
+    } else if reg.len() >= st.cfg.max_regs {
+        // Unauthenticated verb: the cap — not memory growth — is the DoS
+        // answer. Full budget of live regs → refuse; new regs evict nothing.
+        let _ = write_frame(s, &frame_err("503 fabric registry full"));
+        return;
+    }
+    reg.insert(
+        h,
         Registration {
             token: token.to_string(),
             expires,
         },
     );
+    drop(reg);
     let body = serde_json::json!({ "token": token, "expires": expires });
     let _ = write_frame(s, &frame_ok(body.to_string().as_bytes()));
 }
@@ -347,6 +397,12 @@ fn freg(s: &mut std::net::TcpStream, st: &FabricState, req: &serde_json::Value) 
 /// (410). Dedupe on (handle, pointer CID): re-publishing refreshes the
 /// deadline, never duplicates. Over cap: evict oldest (compost, don't
 /// hoard). The envelope is content-addressed into the hold as <cid>.fenv.
+///
+/// REAP STORY (F1 adversarial review, contract): there is no live ticker —
+/// past-deadline envelopes compost at the next fpop drain, at the next
+/// open() rebuild, or here, when a dedupe replaces them. The worst case a
+/// crash-hard node accumulates is max_per_handle expired envelopes per
+/// live registration, all bounded by the cap, all gone at the next touch.
 fn fput(
     s: &mut std::net::TcpStream,
     st: &FabricState,
@@ -358,9 +414,16 @@ fn fput(
         let _ = write_frame(s, &frame_err("400 fput needs handle"));
         return;
     };
+    if h.len() != 64 {
+        // Hex lowercase or uppercase both decode to 32 bytes; 64 chars is
+        // the exact length — refuse everything else before decoding.
+        let _ = write_frame(s, &frame_err("400 handle must be 32-byte hex"));
+        return;
+    }
+    let h = h.to_lowercase();
     {
         let reg = st.reg.lock().unwrap();
-        match reg.get(h) {
+        match reg.get(&h) {
             None => {
                 let _ = write_frame(s, &frame_err("404 unknown handle"));
                 return;
@@ -380,6 +443,10 @@ fn fput(
         let _ = write_frame(s, &frame_err("400 fput needs pointer_hex"));
         return;
     };
+    if ptr_hex.len() != 2 * POINTER_LEN {
+        let _ = write_frame(s, &frame_err("400 pointer must be 74-byte hex"));
+        return;
+    }
     let pointer = match hex::decode(ptr_hex) {
         Ok(p) if p.len() == POINTER_LEN => {
             let mut a = [0u8; POINTER_LEN];
@@ -407,7 +474,7 @@ fn fput(
     let env = Envelope {
         handle: {
             let mut a = [0u8; 32];
-            a.copy_from_slice(&hex::decode(h).unwrap());
+            a.copy_from_slice(&hex::decode(&h).unwrap());
             a
         },
         pointer,
@@ -424,9 +491,18 @@ fn fput(
     let mut queues = st.queues.lock().unwrap();
     let q = queues.entry(h.to_string()).or_default();
     if let Some(old) = q.iter_mut().find(|x| x.pointer == pointer) {
-        // Dedupe: re-publishing refreshes, never duplicates (keep FIFO slot).
+        // Dedupe: refresh the deadline in place. The envelope bytes include
+        // received_at, so a refresh can re-persist under a NEW cid — then the
+        // superseded file must compost, or it lingers on disk and resurrects
+        // as a duplicate at the next restart rebuild. But if the bytes came
+        // out identical (same received_at), old and new cid are the SAME
+        // file: dropping it would orphan the queue entry's only copy and
+        // silently lose the envelope at the next restart.
         old.deadline = deadline;
-        old.env_cid_hex = env_cid_hex;
+        if old.env_cid_hex != env_cid_hex {
+            FabricState::drop_envelope(dir, &old.env_cid_hex);
+            old.env_cid_hex = env_cid_hex;
+        }
     } else {
         q.push(Queued {
             pointer,
@@ -439,25 +515,54 @@ fn fput(
             FabricState::drop_envelope(dir, &evicted.env_cid_hex);
         }
     }
+    // A queued entry whose deadline passed while nobody drained: compost
+    // it and anything else already burned — drain-time, not ticker-time.
+    let now = now_sec();
+    q.retain(|x| {
+        if x.deadline <= now {
+            FabricState::drop_envelope(dir, &x.env_cid_hex);
+            false
+        } else {
+            true
+        }
+    });
     let _ = write_frame(s, &frame_ok(b"{\"queued\":true}"));
 }
 
 /// fpop {handle, token, max} → 0x00 {pointers: [...]} | 404 | 403
 ///
 /// Drain up to max queued pointers, oldest first, deleting on read
-/// (compost-on-read). Wrong token is 403 (constant-time compare); unknown
-/// handle 404. Returns 74-byte pointer hex strings — exactly what the
-/// recipient feeds into E2 ingestion, where FetchFrame re-checks
-/// RouteKey(sid) == p.Route.
-fn fpop(s: &mut std::net::TcpStream, st: &FabricState, req: &serde_json::Value, dir: &str) {
+/// (compost-on-read; entries whose deadline passed while queued compost
+/// here too — the drain is a reap point, there is no ticker). Wrong token
+/// is 403 (constant-time compare); unknown handle 404. fpop shares fput's
+/// per-IP rate window: both are unauthenticated parser paths and neither
+/// should be cheaper to flood than the other. Returns 74-byte pointer hex
+/// strings — exactly what the recipient feeds into E2 ingestion, where
+/// FetchFrame re-checks RouteKey(sid) == p.Route.
+fn fpop(
+    s: &mut std::net::TcpStream,
+    st: &FabricState,
+    req: &serde_json::Value,
+    dir: &str,
+    ip: &str,
+) {
     let Some(h) = req.get("handle").and_then(|v| v.as_str()) else {
         let _ = write_frame(s, &frame_err("400 fpop needs handle"));
         return;
     };
+    if h.len() != 64 {
+        let _ = write_frame(s, &frame_err("400 handle must be 32-byte hex"));
+        return;
+    }
+    let h = h.to_lowercase();
     let token = req.get("token").and_then(|v| v.as_str()).unwrap_or("");
     let max = req.get("max").and_then(|v| v.as_u64()).unwrap_or(8).min(64) as usize;
+    if !st.fput_limiter.allow(ip, now_sec()) {
+        let _ = write_frame(s, &frame_err("429 fpop rate"));
+        return;
+    }
     let reg = st.reg.lock().unwrap();
-    let Some(r) = reg.get(h) else {
+    let Some(r) = reg.get(&h) else {
         let _ = write_frame(s, &frame_err("404 unknown handle"));
         return;
     };
@@ -466,13 +571,17 @@ fn fpop(s: &mut std::net::TcpStream, st: &FabricState, req: &serde_json::Value, 
         return;
     }
     drop(reg);
+    let now = now_sec();
     let mut out: Vec<String> = Vec::new();
     let mut queues = st.queues.lock().unwrap();
-    if let Some(q) = queues.get_mut(h) {
+    if let Some(q) = queues.get_mut(&h) {
         while out.len() < max && !q.is_empty() {
             let item = q.remove(0);
-            out.push(hex::encode(item.pointer));
             FabricState::drop_envelope(dir, &item.env_cid_hex);
+            if item.deadline > now {
+                out.push(hex::encode(item.pointer));
+            }
+            // else: expired while queued — composted, not delivered.
         }
     }
     let body = serde_json::json!({ "pointers": out });
@@ -657,7 +766,14 @@ mod tests {
         let (server, addr) = fabric_server(&dir, fabric_cfg());
         let mut c = std::net::TcpStream::connect(&addr).unwrap();
         let handle = "aa".repeat(32);
-        let token = "t-1".repeat(4);
+        let token = "tok-1234567890abcdef"; // 20 bytes: within the 16..=128 shape
+
+        // Shape rule: a short token is refused before anything else.
+        let (st, _) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"freg","handle":handle,"token":"short","lease":60}),
+        );
+        assert_eq!(st, 0x01, "sub-16-byte token must be refused");
 
         let (st, body) = rpc(
             &mut c,
@@ -665,6 +781,19 @@ mod tests {
         );
         assert_eq!(st, 0x00, "freg: {body}");
         assert_eq!(body["token"], token, "relay echoes the possession token");
+
+        // Chained refresh: a live registration may NOT be overwritten without
+        // the current token (handle is public; possession is the only proof).
+        let (st, _) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"freg","handle":handle,"token":"attacker-token-1234","lease":60}),
+        );
+        assert_eq!(st, 0x01, "takeover without prev_token must be refused");
+        let (st, _) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"freg","handle":handle,"token":token,"prev_token":token,"lease":60}),
+        );
+        assert_eq!(st, 0x00, "renewal with prev_token succeeds");
 
         let ptr = valid_pointer(now_sec() + 600, 1);
         let (st, body) = rpc(
@@ -705,7 +834,7 @@ mod tests {
         let (server, addr) = fabric_server(&dir, fabric_cfg());
         let mut c = std::net::TcpStream::connect(&addr).unwrap();
         let handle = "bb".repeat(32);
-        let token = "tok";
+        let token = "tok-1234567890abcdef"; // 20 bytes: within the shape rule
         let (st, _) = rpc(
             &mut c,
             serde_json::json!({"verb":"freg","handle":handle,"token":token,"lease":60}),
@@ -789,7 +918,7 @@ mod tests {
         let (server, addr) = fabric_server(&dir, fcfg);
         let mut c = std::net::TcpStream::connect(&addr).unwrap();
         let handle = "ee".repeat(32);
-        let token = "t";
+        let token = "tok-1234567890abcdef"; // 20 bytes: within the shape rule
         rpc(
             &mut c,
             serde_json::json!({"verb":"freg","handle":handle,"token":token,"lease":60}),
@@ -817,6 +946,255 @@ mod tests {
             .map(|x| x.as_str().unwrap().to_string())
             .collect();
         assert_eq!(ptrs, vec![p2, p3], "FIFO cap: oldest (p1) evicted");
+        drop(c);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn freg_budget_full_refuses_without_eviction() {
+        let dir = mk_temp_dir("fabric-budget");
+        let fcfg = FabricConfig {
+            enabled: true,
+            max_regs: 2,
+            ..Default::default()
+        };
+        let (server, addr) = fabric_server(&dir, fcfg);
+        let mut c = std::net::TcpStream::connect(&addr).unwrap();
+        let tok = "tok-1234567890abcdef";
+        for h in ["01", "02"] {
+            let (st, body) = rpc(
+                &mut c,
+                serde_json::json!({"verb":"freg","handle":h.repeat(32),"token":tok,"lease":60}),
+            );
+            assert_eq!(st, 0x00, "{body}");
+        }
+        // Budget is full: a NEW handle is refused (503); nothing of the live
+        // regs is evicted — freg is unauthenticated and must not be a tool
+        // for evicting other users.
+        let (st, _) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"freg","handle":"03".repeat(32),"token":tok,"lease":60}),
+        );
+        assert_eq!(st, 0x01, "full budget must refuse new registrations");
+        drop(c);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn freg_expired_slots_swept_on_next_freg() {
+        let dir = mk_temp_dir("fabric-sweep");
+        let fcfg = FabricConfig {
+            enabled: true,
+            max_regs: 1,
+            ..Default::default()
+        };
+        let (server, addr) = fabric_server(&dir, fcfg);
+        let mut c = std::net::TcpStream::connect(&addr).unwrap();
+        let tok = "tok-1234567890abcdef";
+        let (st, body) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"freg","handle":"04".repeat(32),"token":tok,"lease":1}),
+        );
+        assert_eq!(st, 0x00, "{body}");
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        // The only slot is held by an EXPIRED registration: the sweep on the
+        // next freg must free it for a new handle.
+        let (st, body) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"freg","handle":"05".repeat(32),"token":tok,"lease":60}),
+        );
+        assert_eq!(st, 0x00, "expired slot must be swept and reusable: {body}");
+        drop(c);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn fput_dedupe_composts_superseded_envelope_file() {
+        let dir = mk_temp_dir("fabric-dedupe-disk");
+        let (server, addr) = fabric_server(&dir, fabric_cfg());
+        let mut c = std::net::TcpStream::connect(&addr).unwrap();
+        let handle = "06".repeat(32);
+        let tok = "tok-1234567890abcdef";
+        rpc(
+            &mut c,
+            serde_json::json!({"verb":"freg","handle":handle,"token":tok,"lease":60}),
+        );
+        let ptr = valid_pointer(now_sec() + 600, 1);
+        let (st, body) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"fput","handle":handle,"pointer_hex":ptr,"deadline":now_sec()+600}),
+        );
+        assert_eq!(st, 0x00, "{body}");
+        let (st, _) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"fput","handle":handle,"pointer_hex":ptr,"deadline":now_sec()+900}),
+        );
+        assert_eq!(st, 0x00);
+        let fenvs = |d: &std::path::Path| {
+            std::fs::read_dir(d)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "fenv"))
+                .count()
+        };
+        assert_eq!(
+            fenvs(&dir),
+            1,
+            "refresh must leave exactly one envelope file"
+        );
+        let (st, body) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"fpop","handle":handle,"token":tok,"max":8}),
+        );
+        assert_eq!(st, 0x00, "{body}");
+        assert_eq!(body["pointers"].as_array().unwrap().len(), 1);
+        assert_eq!(fenvs(&dir), 0, "drain composts on read");
+        drop(c);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn expired_envelopes_compost_at_rebuild_and_drain() {
+        // (a) rebuild: an envelope whose pointer deadline already passed is
+        // dropped at open() and its file deleted.
+        let dir = mk_temp_dir("fabric-expiry");
+        let handle_hex = "07".repeat(32);
+        let write_env = |deadline: u64, tag: u8| {
+            let mut pb = hex::decode(valid_pointer(deadline, tag)).unwrap();
+            let mut pa = [0u8; POINTER_LEN];
+            pa.copy_from_slice(&pb);
+            pb.clear();
+            let env = Envelope {
+                handle: {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&hex::decode(&handle_hex).unwrap());
+                    h
+                },
+                pointer: pa,
+                received_at: now_sec(),
+            };
+            let raw = marshal_envelope(&env);
+            let cid = hex::encode(Sha256::digest(raw));
+            std::fs::write(dir.join(format!("{cid}.fenv")), raw).unwrap();
+        };
+        write_env(now_sec() - 10, 1); // expired
+        write_env(now_sec() + 600, 2); // live
+        let st = FabricState::open(dir.to_str().unwrap(), fabric_cfg());
+        {
+            let queues = st.queues.lock().unwrap();
+            let q = queues.get(&handle_hex).expect("live envelope rebuilt");
+            assert_eq!(q.len(), 1, "expired envelope must not survive rebuild");
+        }
+        let fenvs: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "fenv"))
+            .collect();
+        assert_eq!(
+            fenvs.len(),
+            1,
+            "expired .fenv file must be deleted at rebuild"
+        );
+
+        // (b) drain: an envelope whose deadline passes while queued composts
+        // at fpop instead of being delivered. Fresh dir and handle so part
+        // (a)'s still-live envelope can't satisfy the drain.
+        let dir_b = mk_temp_dir("fabric-expiry-drain");
+        let handle_b = "09".repeat(32);
+        let (server, addr) = fabric_server(&dir_b, fabric_cfg());
+        let mut c = std::net::TcpStream::connect(&addr).unwrap();
+        let tok = "tok-1234567890abcdef";
+        rpc(
+            &mut c,
+            serde_json::json!({"verb":"freg","handle":handle_b,"token":tok,"lease":60}),
+        );
+        let p = valid_pointer(now_sec() + 2, 3);
+        let (st, body) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"fput","handle":handle_b,"pointer_hex":p,"deadline":now_sec()+2}),
+        );
+        assert_eq!(st, 0x00, "{body}");
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let (st, body) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"fpop","handle":handle_b,"token":tok,"max":8}),
+        );
+        assert_eq!(st, 0x00, "{body}");
+        assert_eq!(
+            body["pointers"].as_array().unwrap().len(),
+            0,
+            "burned envelope must compost, not deliver"
+        );
+        let fenvs: Vec<_> = std::fs::read_dir(&dir_b)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "fenv"))
+            .collect();
+        assert_eq!(
+            fenvs.len(),
+            0,
+            "drained-and-composted envelope gone from disk"
+        );
+        drop(c);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn handle_case_is_not_identity() {
+        // Register with mixed-case hex; publish and drain with lowercase.
+        // If case split the namespace, fput would 404 and the pointer would
+        // strand at a second "identity".
+        let dir = mk_temp_dir("fabric-case");
+        let (server, addr) = fabric_server(&dir, fabric_cfg());
+        let mut c = std::net::TcpStream::connect(&addr).unwrap();
+        let upper = "AB".repeat(32);
+        let lower = "ab".repeat(32);
+        let tok = "tok-1234567890abcdef";
+        let (st, body) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"freg","handle":upper,"token":tok,"lease":60}),
+        );
+        assert_eq!(st, 0x00, "{body}");
+        let p = valid_pointer(now_sec() + 600, 1);
+        let (st, body) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"fput","handle":lower,"pointer_hex":p,"deadline":now_sec()+600}),
+        );
+        assert_eq!(st, 0x00, "case must normalize to one handle slot: {body}");
+        let (st, body) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"fpop","handle":upper,"token":tok,"max":8}),
+        );
+        assert_eq!(st, 0x00, "{body}");
+        assert_eq!(body["pointers"].as_array().unwrap().len(), 1);
+        drop(c);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn fpop_shares_fput_rate_window() {
+        let dir = mk_temp_dir("fabric-fpop-rate");
+        let fcfg = FabricConfig {
+            enabled: true,
+            fput_rate: 2,
+            ..Default::default()
+        };
+        let (server, addr) = fabric_server(&dir, fcfg);
+        let mut c = std::net::TcpStream::connect(&addr).unwrap();
+        // fpop is an unauthenticated parser path: it shares fput's per-IP
+        // window so flooding it is no cheaper than flooding fput.
+        for _ in 0..2 {
+            let (st, _) = rpc(
+                &mut c,
+                serde_json::json!({"verb":"fpop","handle":"08".repeat(32),"token":"x","max":8}),
+            );
+            assert_eq!(st, 0x01, "404 path still consumes budget");
+        }
+        let (st, _) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"fpop","handle":"08".repeat(32),"token":"x","max":8}),
+        );
+        assert_eq!(st, 0x01, "429 after window exhausted");
         drop(c);
         server.join().unwrap();
     }

@@ -985,6 +985,18 @@ fn main() {
                         }
                         i += 2;
                     }
+                    "--fabric-max-regs" => {
+                        if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                            fabric_cfg.max_regs = v;
+                        }
+                        i += 2;
+                    }
+                    "--fabric-max-lease" => {
+                        if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                            fabric_cfg.max_lease_sec = v;
+                        }
+                        i += 2;
+                    }
                     _ => i += 1,
                 }
             }
