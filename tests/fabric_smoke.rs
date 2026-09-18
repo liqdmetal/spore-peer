@@ -124,6 +124,68 @@ fn fpop_pointers(body: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The fabric CLIENT subcommand face: `spore-peer fabric --sub reg|put|pop`
+/// drives a live relay through the real CLI (no library calls). This is the
+/// wire behavior the cross-binary interop test (spore side) depends on:
+/// reg returns rc 0, put returns rc 0, pop prints the pointers to stdout
+/// one per line and exits 0 — with rc 1 and the verbatim relay error
+/// otherwise.
+#[test]
+fn fabric_cli_client_reg_put_pop_roundtrip() {
+    let tok = "tok-1234567890abcdef";
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    let dir = smoke_dir("cli");
+    let (_guard, addr) = spawn_fabric_server(&dir);
+    let handle = "cc".repeat(32);
+    let exe = env!("CARGO_BIN_EXE_spore-peer");
+
+    let run = |args: &[&str]| {
+        let out = Command::new(exe)
+            .args([
+                "fabric", "--addr", &addr, "--sub", args[0], "--handle", &handle,
+            ])
+            .args(&args[1..])
+            .output()
+            .expect("run fabric CLI");
+        (
+            out.status.code().expect("exit code"),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    // reg → rc 0, relay echoes the lease.
+    let (code, _, err) = run(&["reg", "--token", tok, "--lease", "60"]);
+    assert_eq!(code, 0, "reg stderr: {err}");
+    assert!(err.contains("registered"), "reg stderr: {err}");
+
+    // reg again WITHOUT prev_token → rc 1 with the takeover refusal.
+    let (code, _, err) = run(&["reg", "--token", "attacker-token-123456"]);
+    assert_eq!(code, 1, "takeover via CLI must fail");
+    assert!(err.contains("403"), "takeover stderr: {err}");
+
+    // put → rc 0.
+    let p1 = valid_pointer(future, 1);
+    let (code, _, err) = run(&["put", "--pointer", &p1]);
+    assert_eq!(code, 0, "put stderr: {err}");
+
+    // pop → rc 0, the pointer on stdout, one line.
+    let (code, out, err) = run(&["pop", "--token", tok]);
+    assert_eq!(code, 0, "pop stderr: {err}");
+    assert_eq!(out.trim(), p1, "pop prints the drained pointer");
+
+    // pop again → rc 0, empty stdout (compost-on-read).
+    let (code, out, err) = run(&["pop", "--token", tok]);
+    assert_eq!(code, 0, "second pop stderr: {err}");
+    assert!(out.trim().is_empty(), "compost-on-read, got: {out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn fabric_serve_path_end_to_end() {
     let tok = "tok-1234567890abcdef"; // 20 bytes: within the 16..=128 shape

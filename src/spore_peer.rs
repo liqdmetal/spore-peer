@@ -36,6 +36,9 @@
 //!   spore-peer push  --addr host:8099 --dir <body-store-dir>        (rpc2 push subset)
 //!   spore-peer peers --dir <store> add|remove <host:port> | list    (peer list)
 //!   spore-peer sync-loop --dir <store> [--interval 30] [--once]     (bidirectional convergence)
+//!   spore-peer fabric --addr host:8099 --sub reg|put|pop --handle <hex>
+//!       [--token t] [--nonce n] [--pointer <74B hex>] [--lease s] [--max n]
+//!                                                                      (fabric relay client)
 //!
 //! Request (over the frame): JSON {"cid": "<64-hex>"}, or an rpc2/CBOR map
 //! (Peer.Handshake / Peer.Chain / Peer.GetObject / Peer.PutObject) on the
@@ -592,6 +595,98 @@ fn fetch(addr: &str, cid: &str, out: Option<&str>) -> Result<(), String> {
     r
 }
 
+/// Parsed `spore-peer fabric` CLI options — one struct so the client entry
+/// point stays readable (and clippy::too_many_arguments stays quiet).
+struct FabricCli {
+    addr: String,
+    sub: String,
+    handle: String,
+    token: String,
+    nonce: String,
+    pointer: Option<String>,
+    lease: u64,
+    max: usize,
+}
+
+/// fabric_pub — one-shot fabric CLIENT verb (freg/fput/fpop) against a
+/// relay serving -fabric. This is the F2 client face in skeleton form: the
+/// seed-derived handle/token plumbing and the drain loop into E2 ingestion
+/// land with F2 proper, but the wire behavior — §5 frame, JSON verb,
+/// status-prefixed reply — is live here, which is what the cross-binary
+/// fabric interop test drives in both directions.
+fn fabric_pub(o: &FabricCli) -> Result<(), String> {
+    let addr = &o.addr;
+    let sub = o.sub.as_str();
+    let handle_hex = o.handle.as_str();
+    let token = o.token.as_str();
+    let nonce = o.nonce.as_str();
+    let max = o.max;
+    let lease = o.lease;
+    let mut req = serde_json::json!({ "verb": format!("f{sub}"), "handle": handle_hex });
+    match sub {
+        "reg" => {
+            if token.len() < 16 {
+                return Err("token must be >= 16 bytes (relay shape rule)".into());
+            }
+            req["token"] = serde_json::Value::String(token.to_string());
+            req["lease"] = serde_json::Value::from(lease);
+            if !nonce.is_empty() {
+                req["nonce"] = serde_json::Value::String(nonce.to_string());
+            }
+        }
+        "put" => {
+            let p = o
+                .pointer
+                .as_deref()
+                .ok_or_else(|| "fabric put needs --pointer".to_string())?;
+            req["pointer_hex"] = serde_json::Value::String(p.to_string());
+            // The burn deadline rides inside the pointer payload; the relay
+            // validates header, length, and deadline from those bytes.
+        }
+        "pop" => {
+            req["token"] = serde_json::Value::String(token.to_string());
+            req["max"] = serde_json::Value::from(max as u64);
+        }
+        _ => return Err(format!("unknown fabric subcommand {sub} (reg|put|pop)")),
+    }
+    let mut s = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    write_frame(&mut s, req.to_string().as_bytes()).map_err(|e| e.to_string())?;
+    let resp = read_frame(&mut s).map_err(|e| e.to_string())?;
+    if resp.is_empty() {
+        return Err("empty reply".into());
+    }
+    if resp[0] != 0x00 {
+        return Err(String::from_utf8_lossy(&resp[1..]).trim().to_string());
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&resp[1..]).unwrap_or(serde_json::Value::Null);
+    match sub {
+        "reg" => eprintln!(
+            "registered {} until {}",
+            handle_hex,
+            body.get("expires").and_then(|v| v.as_u64()).unwrap_or(0)
+        ),
+        "put" => eprintln!("queued pointer at {handle_hex}"),
+        "pop" => {
+            let ptrs = body
+                .get("pointers")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            eprintln!("drained {} pointer(s) from {handle_hex}", ptrs.len());
+            for p in ptrs {
+                if let Some(ph) = p.as_str() {
+                    // stdout: the drain output, one 74-byte hex pointer per
+                    // line — exactly what a recipient feeds to E2 ingestion.
+                    println!("{ph}");
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// sync_stream runs the rpc2 sync subset against a peer: handshake (learn
 /// the peer's height), chain (what it has), then Peer.GetObject for every
 /// CID the local store is missing. Every body is sha256-verified against
@@ -1043,6 +1138,89 @@ fn main() {
                     Ok(()) => 0,
                     Err(e) => {
                         eprintln!("fetch failed: {e}");
+                        1
+                    }
+                }
+            }
+        }
+        "fabric" => {
+            let mut addr = String::new();
+            let mut sub = String::new();
+            let mut handle = String::new();
+            let mut token = String::new();
+            let mut nonce = String::new();
+            let mut pointer = String::new();
+            let mut lease: u64 = 3600;
+            let mut max: usize = 8;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--addr" => {
+                        addr = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--sub" => {
+                        sub = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--handle" => {
+                        handle = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--token" => {
+                        token = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--nonce" => {
+                        nonce = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--pointer" => {
+                        pointer = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--lease" => {
+                        if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                            lease = v;
+                        }
+                        i += 2;
+                    }
+                    "--max" => {
+                        if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                            max = v;
+                        }
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            if addr.is_empty() || sub.is_empty() || handle.is_empty() {
+                eprintln!(
+                    "fabric needs --addr, --sub reg|put|pop and --handle\n  \
+                     reg: --token t [--nonce n] [--lease s]\n  \
+                     put: --pointer <74-byte hex>\n  \
+                     pop: --token t [--max n] (pointers print to stdout, one per line)"
+                );
+                2
+            } else {
+                let cli = FabricCli {
+                    addr,
+                    sub,
+                    handle,
+                    token,
+                    nonce,
+                    pointer: if pointer.is_empty() {
+                        None
+                    } else {
+                        Some(pointer)
+                    },
+                    lease,
+                    max,
+                };
+                match fabric_pub(&cli) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        eprintln!("fabric {} failed: {e}", cli.sub);
                         1
                     }
                 }
