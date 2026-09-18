@@ -1028,7 +1028,7 @@ fn sync_loop(dir: &str, interval: u64, once: bool) -> Result<(usize, usize, u64)
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: spore-peer <serve|fetch|sync|push|peers|sync-loop> ...");
+        eprintln!("usage: spore-peer <serve|fetch|sync|push|peers|sync-loop|fabric> ...");
         std::process::exit(2);
     }
     let code = match args[1].as_str() {
@@ -1037,6 +1037,8 @@ fn main() {
             let mut dir = ".".to_string();
             let mut cfg = ServeConfig::default();
             let mut fabric_cfg = FabricConfig::default();
+            let mut pidfile: Option<String> = None;
+            let mut announce: Option<String> = None;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -1092,6 +1094,14 @@ fn main() {
                         }
                         i += 2;
                     }
+                    "--pidfile" => {
+                        pidfile = args.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--announce-addr" => {
+                        announce = args.get(i + 1).cloned();
+                        i += 2;
+                    }
                     _ => i += 1,
                 }
             }
@@ -1100,13 +1110,28 @@ fn main() {
                 // connections (restart safety, RELAY_FABRIC flow section).
                 cfg.fabric = Some(Arc::new(FabricState::open(&dir, fabric_cfg)));
             }
-            match serve(&addr, &dir, cfg) {
+            if let Some(pf) = pidfile.as_deref() {
+                // Write the pidfile BEFORE the bind so a process manager
+                // that starts-on-file sees the pid even if the bind then
+                // fails (the failure is reported and exits non-zero).
+                if let Err(e) = write_pidfile(pf) {
+                    eprintln!("serve error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            let rc = match serve(&addr, &dir, cfg, announce.as_deref()) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("serve error: {e}");
                     1
                 }
+            };
+            if let Some(pf) = pidfile.as_deref() {
+                // Graceful exit clears the pidfile; after SIGKILL it stays,
+                // which is the supervisor's dead-process signal.
+                let _ = std::fs::remove_file(pf);
             }
+            rc
         }
         "fetch" => {
             let mut addr = String::new();
@@ -1409,14 +1434,43 @@ fn main() {
 /// laid out per WIRE_SPEC §7 — see serve_body for this implementation's
 /// reading of that on-disk contract (it serves `<cid>.body` only; expiry
 /// records are the holder's business).
-fn serve(addr: &str, dir: &str, cfg: ServeConfig) -> std::io::Result<()> {
+/// write_pidfile creates the parent directory and writes this process's
+/// pid atomically (temp file + rename, so a watcher never reads a partial
+/// pid). Lifecycle: serve removes the file on GRACEFUL exit; after a
+/// SIGKILL it stays — which is exactly what lets a supervisor detect the
+/// dead run (pid no longer alive).
+fn write_pidfile(path: &str) -> Result<(), String> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("pidfile dir {parent:?}: {e}"))?;
+        }
+    }
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, format!("{}\n", std::process::id()))
+        .map_err(|e| format!("pidfile {path}: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("pidfile rename {path}: {e}"))
+}
+
+fn serve(addr: &str, dir: &str, cfg: ServeConfig, announce: Option<&str>) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     // Report the BOUND address, not the configured one: with --listen
     // 127.0.0.1:0 the configured string is a lie, and scripts/tests parse
     // this line to learn the real port.
     let local = listener.local_addr()?;
-    eprintln!("spore-peer serve: listening on {local}, bodies in {dir} (max_store_bytes={} put_rate={}/min write_token={} fabric={})",
-        cfg.max_store_bytes, cfg.put_rate, if cfg.token.is_some() { "set" } else { "off" }, if cfg.fabric.is_some() { "on" } else { "off" });
+    if let Some(a) = announce {
+        // Operators run the daemon behind NAT or a container boundary: the
+        // reachable address is not the bind address. One line, same parse
+        // convention as the listening line — printed BEFORE it, since the
+        // listening line is the readiness signal consumers break on.
+        eprintln!("spore-peer serve: announcing {a}");
+    }
+    eprintln!(
+        "spore-peer serve: listening on {local}, bodies in {dir} (max_store_bytes={} put_rate={}/min write_token={} fabric={})",
+        cfg.max_store_bytes,
+        cfg.put_rate,
+        if cfg.token.is_some() { "set" } else { "off" },
+        if cfg.fabric.is_some() { "on" } else { "off" }
+    );
     let limiter = Arc::new(RateLimiter::new(cfg.put_rate));
     for stream in listener.incoming() {
         match stream {

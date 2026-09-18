@@ -46,19 +46,30 @@ fn smoke_dir(tag: &str) -> PathBuf {
     d
 }
 
-/// Spawn the real binary and wait for its listening line. Panics (with the
-/// stderr captured so far) if the process exits or the line never arrives.
-fn spawn_fabric_server(dir: &Path) -> (ServeGuard, String) {
+/// Spawn the real binary and wait for its listening line. Returns the
+/// guard, the bound address, and every stderr line seen before the listen
+/// announcement (so tests can assert on announce lines too). Panics (with
+/// the stderr captured so far) if the process exits or the line never
+/// arrives.
+fn spawn_fabric_server(dir: &Path) -> (ServeGuard, String, Vec<String>) {
+    spawn_serve(dir, &[])
+}
+
+/// Spawn `serve` with extra operator flags (pidfile, announce-addr, ...) —
+/// the same readiness convention: wait for the "listening on" line.
+fn spawn_serve(dir: &Path, extra: &[String]) -> (ServeGuard, String, Vec<String>) {
     let exe = env!("CARGO_BIN_EXE_spore-peer");
+    let mut args: Vec<String> = vec![
+        "serve".into(),
+        "--listen".into(),
+        "127.0.0.1:0".into(),
+        "--dir".into(),
+        dir.to_str().unwrap().into(),
+        "-fabric".into(),
+    ];
+    args.extend(extra.iter().cloned());
     let mut child = Command::new(exe)
-        .args([
-            "serve",
-            "--listen",
-            "127.0.0.1:0",
-            "--dir",
-            dir.to_str().unwrap(),
-            "-fabric",
-        ])
+        .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -87,7 +98,7 @@ fn spawn_fabric_server(dir: &Path) -> (ServeGuard, String) {
             Err(e) => panic!("read server stderr: {e}; prior: {seen:?}"),
         }
     };
-    (ServeGuard(child), addr)
+    (ServeGuard(child), addr, seen)
 }
 
 /// One fabric request over the §5 frame: JSON in, (status, payload) out.
@@ -130,6 +141,45 @@ fn fpop_pointers(body: &Value) -> Vec<String> {
 /// reg returns rc 0, put returns rc 0, pop prints the pointers to stdout
 /// one per line and exits 0 — with rc 1 and the verbatim relay error
 /// otherwise.
+/// Operator knobs under a process manager: --pidfile must hold the serve
+/// process's pid by the time the listening line is out (written before the
+/// bind, atomic temp+rename, parent dirs created), and --announce-addr must
+/// be echoed on stderr in the same parse convention as the listening line.
+/// Drop here is SIGKILL by design, so the pidfile intentionally remains —
+/// the supervisor's dead-run signal.
+#[test]
+fn serve_pidfile_and_announce_addr() {
+    let dir = smoke_dir("pidfile");
+    let pf = dir.join("run").join("spore-peer.pid");
+    let extra = [
+        "--pidfile".to_string(),
+        pf.to_str().unwrap().to_string(),
+        "--announce-addr".to_string(),
+        "relay.example.org:8099".to_string(),
+    ];
+    let (guard, _addr, lines) = spawn_serve(&dir, &extra);
+
+    let pid = std::fs::read_to_string(&pf).expect("pidfile written before bind");
+    assert_eq!(
+        pid.trim(),
+        guard.0.id().to_string(),
+        "pidfile holds the serve process's pid"
+    );
+
+    let announce = lines
+        .iter()
+        .find(|l| l.starts_with("spore-peer serve: announcing "))
+        .expect("announce line on stderr");
+    assert_eq!(
+        announce.trim(),
+        "spore-peer serve: announcing relay.example.org:8099"
+    );
+
+    drop(guard); // SIGKILL
+    assert!(pf.exists(), "SIGKILL leaves the pidfile for the supervisor");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn fabric_cli_client_reg_put_pop_roundtrip() {
     let tok = "tok-1234567890abcdef";
@@ -139,7 +189,7 @@ fn fabric_cli_client_reg_put_pop_roundtrip() {
         .as_secs()
         + 600;
     let dir = smoke_dir("cli");
-    let (_guard, addr) = spawn_fabric_server(&dir);
+    let (_guard, addr, _lines) = spawn_fabric_server(&dir);
     let handle = "cc".repeat(32);
     let exe = env!("CARGO_BIN_EXE_spore-peer");
 
@@ -197,7 +247,7 @@ fn fabric_serve_path_end_to_end() {
 
     // --- server A: register, publish, dedupe, drain ---
     let dir_a = smoke_dir("a");
-    let (guard, addr) = spawn_fabric_server(&dir_a);
+    let (guard, addr, _lines) = spawn_fabric_server(&dir_a);
     let mut c = TcpStream::connect(&addr).expect("connect");
     c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
 
@@ -255,7 +305,7 @@ fn fabric_serve_path_end_to_end() {
     // pre-existing entry; B publishes one pointer, then restarts pre-drain).
     let dir_b = smoke_dir("b");
     let handle_b = "bb".repeat(32);
-    let (guard_b, addr_b) = spawn_fabric_server(&dir_b);
+    let (guard_b, addr_b, _lines) = spawn_fabric_server(&dir_b);
     let mut cb = TcpStream::connect(&addr_b).expect("connect B");
     cb.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let (st, body) = rpc(
@@ -272,7 +322,7 @@ fn fabric_serve_path_end_to_end() {
     drop(cb);
     drop(guard_b); // SIGKILL — the hold must survive a hard stop
 
-    let (guard_b2, addr_b2) = spawn_fabric_server(&dir_b);
+    let (guard_b2, addr_b2, _lines) = spawn_fabric_server(&dir_b);
     let mut cb2 = TcpStream::connect(&addr_b2).expect("connect B2");
     cb2.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     // The registry is in-memory by design (leases are not durable; queued
@@ -300,7 +350,7 @@ fn fabric_serve_path_end_to_end() {
     // restart of the same dir either.
     drop(c);
     drop(guard);
-    let (guard_a2, addr_a2) = spawn_fabric_server(&dir_a);
+    let (guard_a2, addr_a2, _lines) = spawn_fabric_server(&dir_a);
     let mut ca2 = TcpStream::connect(&addr_a2).expect("connect A2");
     ca2.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let (st, body) = rpc(

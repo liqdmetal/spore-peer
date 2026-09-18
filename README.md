@@ -20,6 +20,16 @@ Sender holds an encrypted body by CID (from `mycelium whisper send-long`):
 Recipient fetches it peer-to-peer:
     spore-peer fetch --addr <sender-host:port> --cid <64hex>
 
+Relay operators run the daemon under a process manager (the -fabric flag
+family serves the relay-fabric verbs on the same socket):
+    spore-peer serve --dir <hold> -fabric --pidfile /run/spore-peer/spore-peer.pid \
+        --announce-addr relay.example.org:8099
+`--pidfile` is written atomically before the bind (parent dirs created);
+a graceful stop removes it, a SIGKILL leaves it — the supervisor's
+dead-run signal. `--announce-addr` echoes the operator-facing address
+(NAT/container boundary) on stderr in the same parse convention as the
+`listening on` line.
+
 Peers can also run the DERO rpc2 sync subset on the same port — one node
 exchanges its whole store with another in a single pass:
     spore-peer sync --addr <peer-host:port> --dir <store-dir>
