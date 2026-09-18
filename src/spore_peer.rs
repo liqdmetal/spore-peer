@@ -1233,9 +1233,13 @@ fn main() {
 /// records are the holder's business).
 fn serve(addr: &str, dir: &str, cfg: ServeConfig) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    let limiter = Arc::new(RateLimiter::new(cfg.put_rate));
-    eprintln!("spore-peer serve: listening on {addr}, bodies in {dir} (max_store_bytes={} put_rate={}/min write_token={} fabric={})",
+    // Report the BOUND address, not the configured one: with --listen
+    // 127.0.0.1:0 the configured string is a lie, and scripts/tests parse
+    // this line to learn the real port.
+    let local = listener.local_addr()?;
+    eprintln!("spore-peer serve: listening on {local}, bodies in {dir} (max_store_bytes={} put_rate={}/min write_token={} fabric={})",
         cfg.max_store_bytes, cfg.put_rate, if cfg.token.is_some() { "set" } else { "off" }, if cfg.fabric.is_some() { "on" } else { "off" });
+    let limiter = Arc::new(RateLimiter::new(cfg.put_rate));
     for stream in listener.incoming() {
         match stream {
             Ok(mut s) => {

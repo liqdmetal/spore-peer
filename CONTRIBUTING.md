@@ -21,6 +21,14 @@ BSD-3-Clause, clean-room. Small, focused patches welcome.
 rustfmt and clippy (`-D warnings`) are blocking gates: a patch that fails
 either does not land, whatever it does for `cargo test`.
 
+The `cargo test` gate also runs `tests/fabric_smoke.rs`, which spawns the
+real `spore-peer serve -fabric` binary and drives freg/fput/fpop over a
+live socket (including a hard kill and restart of the hold). The in-process
+fabric unit tests call `handle_client` directly, so only this smoke catches
+a regression in main()'s `-fabric` flag wiring or the serve loop itself —
+and since the pre-push hook runs `cargo test`, such a break fails the push
+before it can ship.
+
 ## The default `go test` run: -race + cross-binary interop
 
 The spore-side tests in `internal/peerstore` exercise BOTH wire directions
