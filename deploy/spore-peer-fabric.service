@@ -1,0 +1,63 @@
+[Unit]
+Description=spore-peer body store + relay fabric (E2 pointer/body transport)
+Documentation=https://github.com/liqdmetal/spore/blob/main/docs/WIRE_SPEC.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Dedicated user (create once):
+#   useradd --system --home /var/lib/spore-peer --shell /usr/sbin/nologin spore-peer
+User=spore-peer
+Group=spore-peer
+
+# The daemon. --announce-addr is what peers and fabric clients must dial:
+# set it to your PUBLIC host:port (the address behind NAT / the container
+# boundary), not the bind address. --pidfile is written atomically BEFORE
+# the bind (parent dirs auto-created); a graceful stop removes it, a SIGKILL
+# leaves it — systemd's own state, not the file, is what drives Restart, so
+# a leftover file is a diagnostic, never a problem.
+ExecStart=/usr/local/bin/spore-peer serve \
+    --dir /var/lib/spore-peer/hold \
+    --listen 0.0.0.0:8099 \
+    -fabric \
+    --fabric-max-lease 7d \
+    --pidfile /run/spore-peer/spore-peer.pid \
+    --announce-addr relay.example.org:8099
+
+# Graceful stop: SIGTERM lets main() reach the graceful-exit path that
+# removes the pidfile. 30s is generous — the accept loop exits on the next
+# connection boundary; there is no long-lived request to interrupt.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+KillMode=mixed
+
+# Availability: always restart, but stop after 5 fast failures in 60s so a
+# config error (port in use, unwritable hold) cannot become a reboot loop.
+Restart=on-failure
+RestartSec=2
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Hardening: the daemon needs only its hold dir, the pidfile dir, and the
+# listen socket. (NoProtectHome if your hold lives under /home.)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/lib/spore-peer /run/spore-peer
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# Post-start check: the pidfile must exist and hold a live pid. A stale
+# pidfile here means the daemon died before systemd noticed — fail the
+# start instead of silently running unmanaged.
+ExecStartPost=/bin/sh -c 'pid=$(cat /run/spore-peer/spore-peer.pid) && kill -0 "$pid"'
+ExecStopPost=/bin/sh -c 'test ! -f /run/spore-peer/spore-peer.pid || echo "warning: pidfile survived stop — daemon did not exit gracefully (SIGKILLed or crashed)"'
+
+[Install]
+WantedBy=multi-user.target
