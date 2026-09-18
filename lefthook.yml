@@ -17,10 +17,4 @@ pre-push:
     gates:
       run: cargo build --locked && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked
     unix-branch-typecheck:
-      run: |
-        #!/bin/sh
-        if rustup target list --installed | grep -q x86_64-unknown-linux-gnu; then
-          cargo check --locked --target x86_64-unknown-linux-gnu --all-targets
-        else
-          echo "unix-branch-typecheck: SKIPPED (x86_64-unknown-linux-gnu target not installed; rustup target add x86_64-unknown-linux-gnu)"
-        fi
+      run: sh scripts/unix-branch-check.sh
