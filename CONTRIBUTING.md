@@ -17,9 +17,19 @@ BSD-3-Clause, clean-room. Small, focused patches welcome.
     cargo fmt --check
     cargo clippy --locked --all-targets -- -D warnings
     cargo test --locked
+    # cross-target typecheck of the cfg(unix) branch (skips with a note if
+    # the target is not installed — `rustup target add x86_64-unknown-linux-gnu`)
+    cargo check --locked --target x86_64-unknown-linux-gnu --all-targets
 
 rustfmt and clippy (`-D warnings`) are blocking gates: a patch that fails
 either does not land, whatever it does for `cargo test`.
+
+The cross-target check is blocking too where it runs: `cfg(unix)` code is
+not compiled by any of the gates above on a Windows or macOS dev machine,
+so a unix-only defect (an undeclared FFI, a platform API misuse) is
+invisible until a Linux runner builds it. The typecheck for the linux
+target rides the pre-push hook for exactly that reason — it caught a
+never-compiled unix signal branch on its first release-gate dry-run.
 
 The `cargo test` gate also runs `tests/fabric_smoke.rs`, which spawns the
 real `spore-peer serve -fabric` binary and drives freg/fput/fpop over a

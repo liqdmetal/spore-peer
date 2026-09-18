@@ -1,11 +1,25 @@
 # lefthook — pre-push runs this crate's gates in CONTRIBUTING.md order:
-# build, fmt (blocking), clippy -D warnings (blocking), test. A failed gate
-# blocks the push. The Go-side -race + cross-binary interop run is exercised
-# from the spore repo (scripts/gates.sh builds this crate and drives the
-# interop both directions).
+# build, fmt (blocking), clippy -D warnings (blocking), test, plus the
+# cross-target check. A failed gate blocks the push. The Go-side -race +
+# cross-binary interop run is exercised from the spore repo
+# (scripts/gates.sh builds this crate and drives the interop both directions).
+#
+# Cross-target check: cfg(unix) code NEVER compiles on a Windows/macOS dev
+# machine, so a unix-only defect is invisible to every local gate — the first
+# release-gate dry-run built the branch on a Linux runner and failed on an
+# undeclared signal() FFI. The typecheck for the linux target runs here
+# (skipping with a note if the target isn't installed) so that class of
+# defect dies at push time, not in CI.
 #
 # Escape hatches: LEFTHOOK=0 git push ...   or   git push --no-verify
 pre-push:
   commands:
     gates:
       run: cargo build --locked && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked
+    unix-branch-typecheck:
+      run: |-
+        if rustup target list --installed | grep -q x86_64-unknown-linux-gnu; then
+          cargo check --locked --target x86_64-unknown-linux-gnu --all-targets
+        else
+          echo "unix-branch-typecheck: SKIPPED — x86_64-unknown-linux-gnu target not installed (rustup target add x86_64-unknown-linux-gnu)"
+        fi
