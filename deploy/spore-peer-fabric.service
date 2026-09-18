@@ -21,9 +21,13 @@ ExecStart=/usr/local/bin/spore-peer serve \
     --dir /var/lib/spore-peer/hold \
     --listen 0.0.0.0:8099 \
     -fabric \
-    --fabric-max-lease 7d \
     --pidfile /run/spore-peer/spore-peer.pid \
     --announce-addr relay.example.org:8099
+# Fabric knobs are all optional at code defaults (per_handle=32 lease_cap=7d
+# horizon=7d fput_rate=60/min max_regs=50000). The daemon echoes the effective
+# values on the "listening on" readiness line; to tune explicitly, add e.g.:
+#   --fabric-per-handle 64 --fabric-horizon 604800 --fabric-max-lease 604800
+# (seconds; a suffix like 7d is NOT parsed -- see PEER_SETUP.md's knob table.)
 
 # Graceful stop: serve handles SIGTERM directly -- the accept loop stops
 # (observed within ~100ms), accepted handlers drain (5s cap), main() removes

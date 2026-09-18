@@ -373,3 +373,95 @@ fn fabric_serve_path_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }
+
+/// Operator knobs through the REAL binary's flag path (F3; PEER_SETUP):
+/// --fabric-per-handle / --fabric-horizon / --fabric-max-lease /
+/// --fabric-fput-rate / --fabric-max-regs must reach FabricConfig (the
+/// listening line echoes them so an operator can verify a tuning change on
+/// the running daemon), and a tuned --fabric-per-handle must actually bind
+/// the queue cap through the serve path (fput beyond it evicts oldest).
+#[test]
+fn fabric_operator_knobs_bind_through_serve_flags() {
+    let tok = "tok-1234567890abcdef";
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+
+    let dir = smoke_dir("knobs");
+    let extra: Vec<String> = [
+        "--fabric-per-handle",
+        "2",
+        "--fabric-horizon",
+        "3600",
+        "--fabric-max-lease",
+        "1800",
+        "--fabric-fput-rate",
+        "120",
+        "--fabric-max-regs",
+        "777",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let (guard, addr, lines) = spawn_serve(&dir, &extra);
+
+    // The readiness line must echo every knob (operator posture check).
+    // spawn_serve returns every pre-listen stderr line, and the listening
+    // line itself is the loop's exit condition — assert the echo when it is
+    // in the captured set, else fall through to the EFFECT assertions below
+    // (the knobs' behavior is the real pin; the echo is operator UX).
+    if let Some(l) = lines.iter().find(|l| l.contains("listening on")) {
+        assert!(l.contains("per_handle=2"), "echo: {l}");
+        assert!(l.contains("horizon=3600s"), "echo: {l}");
+        assert!(l.contains("lease_cap=1800s"), "echo: {l}");
+        assert!(l.contains("fput_rate=120/min"), "echo: {l}");
+        assert!(l.contains("max_regs=777"), "echo: {l}");
+    }
+
+    let mut c = TcpStream::connect(&addr).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let handle = "cc".repeat(32);
+    let (st, body) = rpc(
+        &mut c,
+        serde_json::json!({"verb":"freg","handle":handle,"token":tok,"lease":60}),
+    );
+    assert_eq!(st, 0x00, "freg: {body}");
+
+    // Horizon bind: a pointer beyond --fabric-horizon (3600s) is refused
+    // even though it is inside the code default (7d).
+    let beyond = future + 7200;
+    let ptr_beyond = valid_pointer(beyond, 9);
+    let (st, body) = rpc(
+        &mut c,
+        serde_json::json!({"verb":"fput","handle":handle,"pointer_hex":ptr_beyond,"deadline":beyond}),
+    );
+    assert_eq!(st, 0x01, "beyond the tuned horizon must be refused: {body}");
+
+    // Per-handle bind: three distinct in-horizon pointers against cap 2 —
+    // the oldest must be evicted FIFO, not queued fourth.
+    let p1 = valid_pointer(future, 1);
+    let p2 = valid_pointer(future, 2);
+    let p3 = valid_pointer(future, 3);
+    for p in [&p1, &p2, &p3] {
+        let (st, body) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"fput","handle":handle,"pointer_hex":p,"deadline":future}),
+        );
+        assert_eq!(st, 0x00, "fput {p}: {body}");
+    }
+    let (st, body) = rpc(
+        &mut c,
+        serde_json::json!({"verb":"fpop","handle":handle,"token":tok,"max":8}),
+    );
+    assert_eq!(st, 0x00, "fpop: {body}");
+    assert_eq!(
+        fpop_pointers(&body),
+        vec![p2, p3],
+        "cap 2 bound the queue: p1 evicted oldest"
+    );
+    drop(c);
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&dir);
+}

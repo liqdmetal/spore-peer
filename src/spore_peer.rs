@@ -1111,6 +1111,12 @@ fn main() {
                         }
                         i += 2;
                     }
+                    "--fabric-horizon" => {
+                        if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                            fabric_cfg.max_deadline_horizon_sec = v;
+                        }
+                        i += 2;
+                    }
                     "--pidfile" => {
                         pidfile = args.get(i + 1).cloned();
                         i += 2;
@@ -1567,7 +1573,21 @@ fn serve(addr: &str, dir: &str, cfg: ServeConfig, announce: Option<&str>) -> std
         cfg.max_store_bytes,
         cfg.put_rate,
         if cfg.token.is_some() { "set" } else { "off" },
-        if cfg.fabric.is_some() { "on" } else { "off" }
+        // Fabric knobs echoed on the readiness line so an operator can
+        // verify a tuning change actually landed on the running daemon
+        // (and so a probe can diff posture against the unit file).
+        if let Some(f) = cfg.fabric.as_ref() {
+            format!(
+                "on (per_handle={} lease_cap={}s horizon={}s fput_rate={}/min max_regs={})",
+                f.cfg.max_per_handle,
+                f.cfg.max_lease_sec,
+                f.cfg.max_deadline_horizon_sec,
+                f.cfg.fput_rate,
+                f.cfg.max_regs
+            )
+        } else {
+            "off".to_string()
+        }
     );
     let limiter = Arc::new(RateLimiter::new(cfg.put_rate));
     let mut in_flight: usize = 0;
