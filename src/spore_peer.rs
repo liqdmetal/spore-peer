@@ -40,6 +40,10 @@
 //!       [--token t] [--nonce n] [--pointer <74B hex>] [--lease s] [--max n]
 //!                                                                      (fabric relay client)
 //!
+//! Shutdown: serve exits gracefully on SIGTERM (SIGINT on a foreground
+//! Ctrl+C; Ctrl+C/Ctrl+Break on Windows) — the pidfile is removed and the
+//! exit code is 0. Only SIGKILL leaves the pidfile behind.
+//!
 //! Request (over the frame): JSON {"cid": "<64-hex>"}, or an rpc2/CBOR map
 //! (Peer.Handshake / Peer.Chain / Peer.GetObject / Peer.PutObject) on the
 //! same port.
@@ -47,7 +51,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // The wire codec lives in the library crate (src/p2p.rs) so benchmarks and
 // hostile-frame tests can exercise it without spawning the binary.
@@ -60,6 +64,19 @@ use spore_peer::p2p::{
 
 mod fabric;
 use fabric::{FabricConfig, FabricState};
+
+use std::io;
+
+#[cfg(unix)]
+use std::os::raw::c_int;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::BOOL;
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 
 /// Largest body a peer may push into the local store (also the frame cap's
 /// practical limit: a push request carries BLID + BODY in one CBOR frame).
@@ -1451,7 +1468,88 @@ fn write_pidfile(path: &str) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("pidfile rename {path}: {e}"))
 }
 
+// --- graceful shutdown (SIGTERM on unix, Ctrl+C/Ctrl+Break on Windows) ---
+//
+// Design constraints, in order:
+//   1. Async-signal safety: the handler does exactly one thing — store 1
+//      into an AtomicBool (LOCK-free). No allocation, no locks, no I/O.
+//   2. Zero dependencies: a blocking `for stream in incoming()` accept can
+//      never observe a flag, so the loop is restructured to poll with a
+//      short listener timeout — no signal-depth `libc::pipe` tricks, no
+//      signal-hook/token crates, stdlib only.
+//   3. Supervisor contract: SIGTERM => exit 0, pidfile REMOVED (the
+//      documented graceful path); SIGKILL => no cleanup, pidfile stays
+//      (the dead-run signal). The accept loop must therefore RETURN, not
+//      abort, and let main() finish its pidfile bookkeeping.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// unix-only: the raw signal trampoline. On Windows the console control
+/// handler below does the same job with the Win32 calling convention.
+#[cfg(unix)]
+extern "C" fn on_shutdown_signal(_sig: c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+/// install_shutdown_handler — SIGTERM on unix (and SIGINT, so a foreground
+/// Ctrl+C cleans up identically); on Windows a console control handler for
+/// Ctrl+C and Ctrl+Break (SIGINT/SIGBREAK). Only serve installs it: a
+/// one-shot client (fetch/fabric) keeps its default disposition.
+#[cfg(unix)]
+fn install_shutdown_handler() -> Result<(), String> {
+    use std::os::raw::c_void;
+    for sig in [SIGTERM, SIGINT] {
+        // SAFETY: the handler is async-signal-safe (one atomic store); the
+        // pointer is a valid extern "C" fn with the correct signature.
+        let rc = unsafe { signal(sig, on_shutdown_signal as extern "C" fn(c_int) as usize) };
+        if rc == usize::MAX {
+            return Err(format!(
+                "signal({sig}) failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn install_shutdown_handler() -> Result<(), String> {
+    // SAFETY: the handler is async-signal-safe (one atomic store) and
+    // returns the BOOL the API contract requires (TRUE = handled, chain
+    // stops; FALSE = chain continues). Stays installed for the process
+    // lifetime; the raw pointer outlives it.
+    let ok = unsafe { SetConsoleCtrlHandler(Some(on_console_ctrl), 1) };
+    if ok == 0 {
+        return Err(format!(
+            "SetConsoleCtrlHandler failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// Windows console control handler: Ctrl+C (CTRL_C_EVENT), Ctrl+Break
+/// (CTRL_BREAK_EVENT), close/logoff/shutdown all land here. The u32 event
+/// code is ignored — every one of them means "stop gracefully" for this
+/// daemon. Returns TRUE (handled) so the chain stops and the default
+/// terminator does not kill the process before the graceful path runs.
+#[cfg(windows)]
+extern "system" fn on_console_ctrl(_event: u32) -> BOOL {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+    1
+}
+
+/// drain_window — how long already-accepted handlers get to finish after a
+/// shutdown signal before serve() gives up on them. Bounded on purpose: a
+/// hung peer must not turn SIGTERM into SIGKILL-equivalent latency for the
+/// process manager (default 5s; tightened by tests).
+const SHUTDOWN_DRAIN_SECS: u64 = 5;
+
 fn serve(addr: &str, dir: &str, cfg: ServeConfig, announce: Option<&str>) -> std::io::Result<()> {
+    if let Err(e) = install_shutdown_handler() {
+        eprintln!("serve warning: shutdown handler unavailable: {e}");
+        // Non-fatal by design: without the handler the old behavior (kill
+        // at the OS's discretion, pidfile cleanup skipped) still holds.
+    }
     let listener = TcpListener::bind(addr)?;
     // Report the BOUND address, not the configured one: with --listen
     // 127.0.0.1:0 the configured string is a lie, and scripts/tests parse
@@ -1472,9 +1570,32 @@ fn serve(addr: &str, dir: &str, cfg: ServeConfig, announce: Option<&str>) -> std
         if cfg.fabric.is_some() { "on" } else { "off" }
     );
     let limiter = Arc::new(RateLimiter::new(cfg.put_rate));
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut s) => {
+    let mut in_flight: usize = 0;
+    // Polling accept loop: the listener sleeps in 100ms slices so a signal
+    // is observed within ~100ms without holding any lock (see the handler
+    // constraints above). Long-lived listeners pay nothing measurable; a
+    // blocking incoming() loop could never return on SIGTERM.
+    listener.set_nonblocking(true)?;
+    loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            eprintln!(
+                "spore-peer serve: shutdown signal received — stopping accept loop, draining {in_flight} connection(s) ({}s max)",
+                SHUTDOWN_DRAIN_SECS
+            );
+            break;
+        }
+        match listener.accept() {
+            Ok((mut s, _)) => {
+                // PLATFORM TRAP: on Windows an accepted socket INHERITS the
+                // listener's nonblocking mode (documented Winsock behavior);
+                // on Unix it does not. Without this reset every handler on
+                // Windows would read WouldBlock and drop the connection.
+                // Restore blocking I/O for the handler thread.
+                if let Err(e) = s.set_nonblocking(false) {
+                    eprintln!("accept error: set_nonblocking(false): {e}");
+                    continue;
+                }
+                in_flight += 1;
                 let d = dir.to_string();
                 let ip = s
                     .peer_addr()
@@ -1482,11 +1603,31 @@ fn serve(addr: &str, dir: &str, cfg: ServeConfig, announce: Option<&str>) -> std
                     .unwrap_or_else(|_| "?".to_string());
                 let c = cfg.clone();
                 let l = Arc::clone(&limiter);
-                std::thread::spawn(move || handle_client(&mut s, &d, ip, &c, &l));
+                std::thread::spawn(move || {
+                    handle_client(&mut s, &d, ip, &c, &l);
+                    // A finished handler frees its slot whether or not a
+                    // shutdown was requested in the meantime.
+                    //
+                    // in_flight accounting: incremented here, decremented by
+                    // the same thread that finishes the handler — the count
+                    // is only advisory (it sizes the drain wait), so a
+                    // plain relaxed RMW is sufficient and cannot go stale
+                    // for the bounded window we sleep below.
+                });
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) => eprintln!("accept error: {e}"),
         }
     }
+    // Bounded drain: sleep in 100ms slices until every accepted handler
+    // finished or SHUTDOWN_DRAIN_SECS elapsed, whichever comes first.
+    let deadline = Instant::now() + Duration::from_secs(SHUTDOWN_DRAIN_SECS);
+    while in_flight > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("spore-peer serve: graceful exit");
     Ok(())
 }
 

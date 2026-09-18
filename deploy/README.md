@@ -39,13 +39,14 @@ path removes the pidfile. A crash or SIGKILL leaves it — the unit's
 
 ## Windows
 
-Windows console processes have no POSIX-signal equivalent: a service stop
-becomes `TerminateProcess` (Rust's default console handler terminates
-without running cleanup), so **the pidfile surviving a Windows stop is
-expected** — that is exactly the SIGKILL contract the flag documents. The
-wrapper treats a stale pidfile accordingly: a *deliberate* stop removes it;
-a crashed run's leftover is cleared at the next start, after checking the
-pid it names is really dead.
+Windows has no POSIX signals: an SCM stop (or `Stop-Process`) becomes
+`TerminateProcess`, which cannot run cleanup — so **the pidfile surviving a
+service stop is expected**, and the wrapper removes it after a deliberate
+stop and clears a crashed run's leftover at the next start (after checking
+the pid it names is really dead). A console-hosted daemon (Task Scheduler
+console host, NSSM, or a plain terminal) gets the graceful path instead:
+serve installs a console control handler, so Ctrl+C / Ctrl+Break exit 0 and
+remove the pidfile — the same contract as SIGTERM on Linux.
 
 ### Option A — Task Scheduler + the wrapper script (no extra tools)
 
@@ -59,9 +60,11 @@ schtasks /Create /TN spore-peer-fabric /SC ONSTART /RU SYSTEM `
 schtasks /Run   /TN spore-peer-fabric       # start now, no reboot needed
 ```
 
-The script self-watches (restart budget: 5 failures per 60s with backoff),
-writes its log where the announce/listening lines are greppable, and
-supports `stop` / `status` verbs.
+The script self-watches (restart budget: 5 failures per 60s with backoff;
+a graceful daemon exit -- Ctrl+C/Ctrl+Break, now exit 0 with the pidfile
+removed -- ends the watcher instead of triggering a restart), writes its
+log where the announce/listening lines are greppable, and supports
+`stop` / `status` verbs.
 
 ### Option B — NSSM (a real Windows service)
 

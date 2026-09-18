@@ -184,6 +184,10 @@ if ($Watch) {
         $p = Invoke-RunOnce
         if ($null -eq $p) { exit 4 }        # refused: live daemon owns the pidfile
         $p.WaitForExit()
+        # Exit 0 is the daemon's GRACEFUL exit (SIGTERM / Ctrl+C / Ctrl+Break
+        # with the pidfile removed) -- a deliberate stop, not a failure:
+        # propagate it instead of fighting the operator with a restart.
+        if ($p.ExitCode -eq 0) { Write-Host 'daemon exited gracefully (deliberate stop); watcher done'; exit 0 }
         Write-Warning "daemon exited (code $($p.ExitCode)) -- restarting after backoff"
         $failures.Add((Get-Date))
         $backoff = [Math]::Min($script:BackoffBaseS * $failures.Count, 30)

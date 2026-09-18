@@ -25,9 +25,11 @@ ExecStart=/usr/local/bin/spore-peer serve \
     --pidfile /run/spore-peer/spore-peer.pid \
     --announce-addr relay.example.org:8099
 
-# Graceful stop: SIGTERM lets main() reach the graceful-exit path that
-# removes the pidfile. 30s is generous — the accept loop exits on the next
-# connection boundary; there is no long-lived request to interrupt.
+# Graceful stop: serve handles SIGTERM directly -- the accept loop stops
+# (observed within ~100ms), accepted handlers drain (5s cap), main() removes
+# the pidfile and exits 0. 30s is far beyond that drain window; if it ever
+# elapses, systemd escalates to SIGKILL and the surviving pidfile is the
+# dead-run signal.
 KillSignal=SIGTERM
 TimeoutStopSec=30
 KillMode=mixed
