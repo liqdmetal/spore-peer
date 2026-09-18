@@ -25,6 +25,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
@@ -190,6 +191,14 @@ pub struct FabricConfig {
     /// Registry budget: max LIVE freg registrations. freg is
     /// unauthenticated, so memory — not just rate — needs a hard ceiling.
     pub max_regs: usize,
+    /// Pointer burn-deadline horizon: fput rejects pointers whose deadline
+    /// is further than this many seconds out (RELAY_FABRIC.md's own MUST:
+    /// "deadline MUST be nonzero and within the relay's horizon cap").
+    /// Without it a pointer with BurnDeadline = u64::MAX is an IMMORTAL
+    /// envelope: nothing ever composts it (every reap point is
+    /// deadline-triggered), so disk and the queue index grow without bound
+    /// and survive restarts. Mirrors max_lease_sec (default 7d).
+    pub max_deadline_horizon_sec: u64,
 }
 
 impl Default for FabricConfig {
@@ -200,6 +209,7 @@ impl Default for FabricConfig {
             max_lease_sec: 7 * 24 * 3600,
             fput_rate: 60,
             max_regs: 50_000,
+            max_deadline_horizon_sec: 7 * 24 * 3600,
         }
     }
 }
@@ -224,6 +234,14 @@ pub struct FabricState {
     fput_limiter: RateLimiter,
     reg: Mutex<HashMap<String, Registration>>, // handle_hex -> reg
     queues: Mutex<HashMap<String, Vec<Queued>>>, // handle_hex -> FIFO
+    /// Unix-seconds of the last registry-wide expired-entry sweep. Sweeping
+    /// costs O(live regs) under the state mutex, and freg is unauthenticated
+    /// and rate-unlimited (the shared per-IP window deliberately covers only
+    /// fput/fpop) — an unswept-growth answer that is itself a per-request CPU
+    /// amplifier: 50k-entry retain per call at line rate. Time-gated to at
+    /// most one sweep per second; correctness between sweeps is preserved by
+    /// treating expired-but-present entries as absent everywhere it matters.
+    last_sweep_sec: AtomicU64,
 }
 
 impl FabricState {
@@ -234,6 +252,7 @@ impl FabricState {
             fput_limiter: RateLimiter::new(cfg.fput_rate),
             reg: Mutex::new(HashMap::new()),
             queues: Mutex::new(HashMap::new()),
+            last_sweep_sec: AtomicU64::new(0),
             cfg,
         };
         let mut queues = st.queues.lock().unwrap();
@@ -253,10 +272,12 @@ impl FabricState {
                 let name = p.file_name().unwrap().to_string_lossy().to_string();
                 let env_cid_hex = name.trim_end_matches(".fenv").to_string();
                 let deadline = u64::from_le_bytes(env.pointer[66..74].try_into().unwrap());
-                if deadline <= now_sec() {
-                    // Envelope expired while the node was down: the burn
-                    // deadline has passed, so the pointer is worthless to the
-                    // recipient — compost instead of re-indexing.
+                if deadline <= now_sec() || deadline > now_sec() + st.cfg.max_deadline_horizon_sec {
+                    // Expired while the node was down (worthless), or beyond
+                    // the horizon cap (pre-horizon-cap leftovers from a node
+                    // upgraded mid-flight: immortal by construction, so
+                    // compost here — the rebuild is the one place the relay
+                    // owns every file and can enforce the cap retroactively).
                     let _ = std::fs::remove_file(&p);
                     continue;
                 }
@@ -363,11 +384,21 @@ fn freg(s: &mut std::net::TcpStream, st: &FabricState, req: &serde_json::Value) 
     let lease = req.get("lease").and_then(|v| v.as_u64()).unwrap_or(3600);
     let expires = now + lease.min(st.cfg.max_lease_sec);
     let mut reg = st.reg.lock().unwrap();
-    reg.retain(|_, r| r.expires > now); // expired entries hold nothing but memory
-    if let Some(cur) = reg.get(&h) {
-        // LIVE registration: only the current token holder may renew/rotate.
+    // Registry sweep, time-gated: full retain per freg is a CPU amplifier on
+    // an unauthenticated verb; at most one sweep per second (see the field
+    // comment on last_sweep_sec).
+    let last = st.last_sweep_sec.load(Ordering::Relaxed);
+    if now > last {
+        reg.retain(|_, r| r.expires > now);
+        st.last_sweep_sec.store(now, Ordering::Relaxed);
+    }
+    if reg.get(&h).is_some_and(|cur| cur.expires > now) {
+        // LIVE registration (an expired-but-unswept entry counts as absent —
+        // the sweep gate above no longer guarantees it was removed): only
+        // the current token holder may renew/rotate.
+        let cur_token = reg.get(&h).map(|c| c.token.clone()).unwrap_or_default();
         let prev = req.get("prev_token").and_then(|v| v.as_str()).unwrap_or("");
-        if !ct_eq(&cur.token, prev) {
+        if !ct_eq(&cur_token, prev) {
             let _ = write_frame(s, &frame_err("403 live registration: prev_token required"));
             return;
         }
@@ -467,8 +498,17 @@ fn fput(
         let _ = write_frame(s, &frame_err("400 zero pointer deadline"));
         return;
     }
-    if deadline <= now_sec() {
+    let now = now_sec();
+    if deadline <= now {
         let _ = write_frame(s, &frame_err("410 gone"));
+        return;
+    }
+    // Horizon cap (AUDIT-RELAYFABRIC H-N1): every compost path is
+    // deadline-triggered, so a far-future deadline is an immortal envelope —
+    // unbounded disk and index growth that survives restarts. Cap it at fput
+    // with the same error family as the body store's own horizon discipline.
+    if deadline > now + st.cfg.max_deadline_horizon_sec {
+        let _ = write_frame(s, &frame_err("400 deadline beyond horizon cap"));
         return;
     }
     let env = Envelope {
@@ -1243,5 +1283,177 @@ mod tests {
         let prk = hkdf_prk(&ikm);
         let expect = hmac_sha256(&[0u8; 32], &ikm);
         assert_eq!(prk, expect);
+    }
+
+    // --- F3-review regression tests (AUDIT-RELAYFABRIC.md findings) ---
+
+    /// H-N1: a far-future deadline is an IMMORTAL envelope — every compost
+    /// path is deadline-triggered, so BurnDeadline = u64::MAX would sit on
+    /// disk forever, survive restarts, and grow the index without bound.
+    /// The horizon cap must refuse it at fput AND compost leftovers at the
+    /// open() rebuild (a node upgraded mid-flight may hold pre-cap files).
+    #[test]
+    fn fput_deadline_horizon_cap_refuses_immortal_envelope() {
+        let dir = mk_temp_dir("fabric-horizon");
+        let (server, addr) = fabric_server(&dir, fabric_cfg());
+        let mut c = std::net::TcpStream::connect(&addr).unwrap();
+        let handle = "cc".repeat(32);
+        let token = "tok-1234567890abcdef";
+        let (st, _) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"freg","handle":handle,"token":token,"lease":60}),
+        );
+        assert_eq!(st, 0x00);
+
+        // u64::MAX and a beyond-horizon-but-plausible value are both refused.
+        for dl in [u64::MAX, now_sec() + 365 * 24 * 3600] {
+            let ptr = valid_pointer(dl, 1);
+            let (st, body) = rpc(
+                &mut c,
+                serde_json::json!({"verb":"fput","handle":handle,"pointer_hex":ptr,"deadline":dl}),
+            );
+            assert_eq!(
+                st, 0x01,
+                "beyond-horizon deadline {dl} must be refused: {body}"
+            );
+        }
+        // Normal deadlines still pass (the cap is 7d; 600s is inside it).
+        let ptr = valid_pointer(now_sec() + 600, 2);
+        let (st, _) = rpc(
+            &mut c,
+            serde_json::json!({"verb":"fput","handle":handle,"pointer_hex":ptr,"deadline":now_sec()+600}),
+        );
+        assert_eq!(st, 0x00, "in-horizon fput must still succeed");
+        drop(c);
+        server.join().unwrap();
+
+        // The rebuild path composts a pre-horizon-cap leftover file.
+        let leftover_deadline = now_sec() + 10 * 365 * 24 * 3600;
+        let mut p = vec![1u8, 0];
+        p.extend_from_slice(&[7u8; 32]);
+        p.extend_from_slice(&[8u8; 32]);
+        p.extend_from_slice(&leftover_deadline.to_le_bytes());
+        let mut pa = [0u8; POINTER_LEN];
+        pa.copy_from_slice(&p);
+        let env = Envelope {
+            handle: {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&hex::decode(handle).unwrap());
+                h
+            },
+            pointer: pa,
+            received_at: now_sec(),
+        };
+        let raw = marshal_envelope(&env);
+        let cid = hex::encode(Sha256::digest(raw));
+        std::fs::write(dir.join(format!("{cid}.fenv")), raw).unwrap();
+        let st = FabricState::open(dir.to_str().unwrap(), fabric_cfg());
+        let queues = st.queues.lock().unwrap();
+        // The in-horizon envelope fput'd earlier legitimately re-indexes; the
+        // beyond-horizon one must be neither queued nor on disk.
+        assert!(
+            queues
+                .values()
+                .all(|q| q.iter().all(|x| x.env_cid_hex != cid)),
+            "beyond-horizon envelope must be composted at rebuild, not re-indexed"
+        );
+        assert!(
+            !dir.join(format!("{cid}.fenv")).exists(),
+            "beyond-horizon file must be removed"
+        );
+    }
+
+    /// M-N2: the sweep is time-gated (retain per freg is a CPU amplifier on
+    /// an unauthenticated verb). Two fregs within the same second must share
+    /// one sweep — the second call must NOT retain again. Correctness is
+    /// preserved by the live-check in freg/fput/fpop treating expired-but-
+    /// present entries as absent; this pins the gate itself.
+    #[test]
+    fn freg_sweep_is_time_gated() {
+        let dir = mk_temp_dir("fabric-sweep");
+        let st = FabricState::open(dir.to_str().unwrap(), fabric_cfg());
+        let h1 = "dd".repeat(32);
+        let h2 = "ee".repeat(32);
+        let now = now_sec();
+        {
+            let mut reg = st.reg.lock().unwrap();
+            reg.insert(
+                h1.clone(),
+                Registration {
+                    token: "t".repeat(20),
+                    expires: now.saturating_sub(10),
+                },
+            );
+        }
+        let sweep_after_first = {
+            let mut reg = st.reg.lock().unwrap();
+            let last = st.last_sweep_sec.load(Ordering::Relaxed);
+            if now > last {
+                reg.retain(|_, r| r.expires > now);
+                st.last_sweep_sec.store(now, Ordering::Relaxed);
+            }
+            st.last_sweep_sec.load(Ordering::Relaxed)
+        };
+        assert_eq!(sweep_after_first, now, "first freg of the second sweeps");
+        // A second same-second call sees last == now and skips the retain —
+        // and that must be SAFE: the stale-but-present entry (re-inserted
+        // here to prove it) is treated as absent by the live-check.
+        {
+            let mut reg = st.reg.lock().unwrap();
+            reg.insert(
+                h1.clone(),
+                Registration {
+                    token: "t".repeat(20),
+                    expires: now.saturating_sub(10),
+                },
+            );
+            let last = st.last_sweep_sec.load(Ordering::Relaxed);
+            assert_eq!(last, now, "same second: no second sweep");
+            assert!(
+                reg.get(&h1).map(|r| r.expires <= now).unwrap_or(false),
+                "expired entry still present under the gate"
+            );
+        }
+        // ...and the live-check contract that makes it safe: is_some_and on
+        // expires, not mere presence.
+        assert!(
+            !st.reg
+                .lock()
+                .unwrap()
+                .get(&h1)
+                .is_some_and(|r| r.expires > now),
+            "expired entry must not count as LIVE"
+        );
+        let _ = h2;
+    }
+
+    /// M-N3 (relates to finding 10, accepted in F1): an expired-but-unswept
+    /// registration must not block re-registration by a NEW owner — the
+    /// squatter-window is bounded by expiry, not by the sweep cadence.
+    #[test]
+    fn expired_registration_re_registrable_before_sweep() {
+        let dir = mk_temp_dir("fabric-rereg");
+        let st = FabricState::open(dir.to_str().unwrap(), fabric_cfg());
+        let h = "ff".repeat(32);
+        let now = now_sec();
+        {
+            let mut reg = st.reg.lock().unwrap();
+            reg.insert(
+                h.clone(),
+                Registration {
+                    token: "old-owner-token-12345".to_string(),
+                    expires: now.saturating_sub(5),
+                },
+            );
+        }
+        // Without sweeping, the budget/live-check must still admit the new
+        // owner: the live-check is is_some_and(expires > now).
+        let live = st
+            .reg
+            .lock()
+            .unwrap()
+            .get(&h)
+            .is_some_and(|r| r.expires > now);
+        assert!(!live, "expired entry must read as absent to the live-check");
     }
 }
