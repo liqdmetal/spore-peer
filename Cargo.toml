@@ -21,6 +21,11 @@ sha2 = "0.10"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_System_Threading"] }
 
+# Platform FFI declarations only (signal/SIGTERM/SIGINT for the graceful
+# shutdown handler) — mirrors windows-sys on the other side. No logic deps.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 criterion = "0.5"
 

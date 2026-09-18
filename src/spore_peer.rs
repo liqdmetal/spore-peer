@@ -71,6 +71,13 @@ use std::io;
 use std::os::raw::c_int;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
+// PLATFORM NOTE: signal/SIGTERM/SIGINT are libc FFI declarations (see the
+// cfg(unix) dependency in Cargo.toml). This branch was NEVER compiled on the
+// dev machine (Windows) until the first release-gate dry-run built it on a
+// Linux runner — gates now cross-check this target so it can never regress
+// silently again.
+#[cfg(unix)]
+use libc::{signal, SIGINT, SIGTERM};
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(windows)]
@@ -1502,7 +1509,6 @@ extern "C" fn on_shutdown_signal(_sig: c_int) {
 /// one-shot client (fetch/fabric) keeps its default disposition.
 #[cfg(unix)]
 fn install_shutdown_handler() -> Result<(), String> {
-    use std::os::raw::c_void;
     for sig in [SIGTERM, SIGINT] {
         // SAFETY: the handler is async-signal-safe (one atomic store); the
         // pointer is a valid extern "C" fn with the correct signature.

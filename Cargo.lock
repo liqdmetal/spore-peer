@@ -519,6 +519,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "hex",
+ "libc",
  "serde_json",
  "sha2",
  "windows-sys 0.59.0",
