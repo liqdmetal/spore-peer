@@ -59,6 +59,35 @@ jobs:
         # would rewrite. Backlog drained 2026-09-10.
         run: cargo fmt -- --check
 
+  # libFuzzer smoke for the rpc2/CBOR decoder (fuzz/fuzz_targets/
+  # fuzz_p2p_decode.rs). Independent of notify-spore on purpose: the
+  # contract gate keys on test/clippy/fmt, and a fuzz finding lands as its
+  # own red job, not as a cross-repo dispatch delay. Nightly + ASan are
+  # required for libFuzzer, so this runs only here — on windows-gnu hosts
+  # the same invariants are exercised by tests/fuzz_lite.rs on stable.
+  fuzz:
+    name: fuzz smoke (libFuzzer, nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The fuzz crate is its own workspace; cache both builds.
+          workspaces: |
+            . -> target
+            fuzz -> target/fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz the rpc2/CBOR decoder (2-minute smoke)
+        # Corpus seeds come from fuzz/corpus/fuzz_p2p_decode (generated from
+        # spore/docs/interop-vectors.json + regression shapes — see
+        # fuzz/gen_corpus.py). Crashes land in fuzz/artifacts/ (gitignored):
+        # attach the file to the fix PR, fold it into the corpus as a seed.
+        run: |
+          cd fuzz
+          cargo fuzz run fuzz_p2p_decode -- -max_total_time=120 -max_len=8192 -rss_limit_mb=2560
+
   # Fire the other half of the wire contract: spore gates its peerstore
   # against THIS commit via its spore-peer-contract.yml repository_dispatch,
   # so a Rust change is proven against the Go side the moment it lands on

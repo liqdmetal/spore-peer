@@ -83,6 +83,28 @@ tests skip rather than panic — a missing file is a layout fact, not a
 conformance failure. If you extend the protocol: add vectors to spore's
 `docs/interop-vectors.json` first, then make both implementations agree.
 
+## Fuzzing
+
+The rpc2/CBOR wire decoder (`src/p2p.rs`) is under libFuzzer:
+`fuzz/fuzz_targets/fuzz_p2p_decode.rs` drives `decode_message` with two
+oracles — panic-free on arbitrary input, and content-drift-free under
+appended garbage (appended bytes may make a frame undecodable — the decoder
+tries the tail as the payload item — but must never change what the prefix
+decodes to).
+
+- **Local (Linux/macOS):** `cargo +nightly fuzz run fuzz_p2p_decode` from
+  `fuzz/`. Seeds live in `fuzz/corpus/fuzz_p2p_decode/` (generated from
+  spore's `docs/interop-vectors.json` + regression shapes by
+  `fuzz/gen_corpus.py` — regenerate it whenever the vectors change).
+- **Local (windows-gnu):** rustc sanitizers don't support gnu targets, and
+  libFuzzer's C++ sources need a fuller MSVC toolchain — `cargo fuzz run`
+  cannot hunt here. `tests/fuzz_lite.rs` is the stable mirror: every
+  `cargo test` replays the corpus and a deterministic structured-mutation
+  round through the same oracles.
+- **CI:** a 2-minute `cargo fuzz run` smoke job on every push/PR (ubuntu,
+  nightly). A crasher lands in `fuzz/artifacts/` — fold it into the corpus
+  as a seed alongside the fix so it can never regress unnoticed.
+
 ## Commits
 
 Conventional subjects (`feat:`, `fix:`, `test:`, `docs:`, `ci:`). rustfmt
