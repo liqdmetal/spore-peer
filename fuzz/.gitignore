@@ -1,0 +1,5 @@
+# libFuzzer outputs — never committed
+artifacts/
+crashes/
+coverage/
+target/

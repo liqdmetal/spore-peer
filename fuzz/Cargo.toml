@@ -1,0 +1,23 @@
+[package]
+name = "spore-peer-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+notes = "cargo-fuzz harness crate. Run via `cargo fuzz run fuzz_p2p_decode` (nightly + libFuzzer; Linux/macOS). On windows-gnu hosts rustc sanitizers are unavailable — the same invariants run locally in tests/fuzz_lite.rs on stable."
+
+[dependencies]
+libfuzzer-sys = "0.4"
+spore-peer = { path = ".." }
+
+[[bin]]
+name = "fuzz_p2p_decode"
+path = "fuzz_targets/fuzz_p2p_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Own workspace root: the fuzz crate must not join the main crate's
+# workspace (its toolchain and dependency graph are nightly/fuzzer-only).
+[workspace]
