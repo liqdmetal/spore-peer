@@ -1,0 +1,5 @@
+# ClusterFuzzLite project metadata
+# (https://google.github.io/clusterfuzzlite/build-integration/#project.yaml).
+# 'rust' selects the base-builder-rust image so cargo/cargo-fuzz and the
+# nightly libfuzzer-sys toolchain used by build.sh exist in the container.
+language: rust

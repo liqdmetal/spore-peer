@@ -1,0 +1,8 @@
+# Root build-context exclusions for the ClusterFuzzLite docker build
+# (context = repo root, Dockerfile = .clusterfuzzlite/Dockerfile, COPY .
+# = whole tree). Local build artifacts and git history don't belong in the
+# builder image; CI checkouts are shallow and clean anyway, so this mainly
+# keeps local `docker build` runs honest and fast.
+.git
+target
+fuzz/target

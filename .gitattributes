@@ -1,3 +1,7 @@
 # Shell scripts must stay LF in every checkout: they are executed by
 # bash/sh (pre-push hooks, CI), and CRLF endings are parse errors there.
 *.sh text eol=lf
+
+# ClusterFuzzLite build files are consumed by docker build inside Linux
+# containers; CRLF in RUN continuation lines breaks the build.
+Dockerfile text eol=lf

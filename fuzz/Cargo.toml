@@ -5,6 +5,9 @@ publish = false
 edition = "2021"
 
 [package.metadata]
+# cargo-fuzz's own manifest marker (cargo fuzz build refuses to run without
+# it — the crate predates the marker because it was hand-authored).
+cargo-fuzz = true
 notes = "cargo-fuzz harness crate. Run via `cargo fuzz run fuzz_p2p_decode` (nightly + libFuzzer; Linux/macOS). On windows-gnu hosts rustc sanitizers are unavailable — the same invariants run locally in tests/fuzz_lite.rs on stable."
 
 [dependencies]
