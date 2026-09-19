@@ -329,11 +329,23 @@ pub fn handle_verb(
         return;
     };
     match req.get("verb").and_then(|v| v.as_str()) {
-        Some("freg") => freg(s, st, req),
-        Some("fput") => fput(s, st, req, dir, ip),
-        Some("fpop") => fpop(s, st, req, dir, ip),
+        Some("freg") => reply(s, run_freg(st, req)),
+        Some("fput") => reply(s, run_fput(st, req, dir, ip)),
+        Some("fpop") => reply(s, run_fpop(st, req, dir, ip)),
         _ => {
             let _ = write_frame(s, &frame_err("400 bad fabric verb"));
+        }
+    }
+}
+
+/// reply — the legacy-frame boundary: one semantic outcome, one frame.
+fn reply(s: &mut std::net::TcpStream, r: Result<serde_json::Value, String>) {
+    match r {
+        Ok(body) => {
+            let _ = write_frame(s, &frame_ok(body.to_string().as_bytes()));
+        }
+        Err(e) => {
+            let _ = write_frame(s, &frame_err(&e));
         }
     }
 }
@@ -363,22 +375,26 @@ pub fn handle_verb(
 /// Handles are normalized to lowercase hex before use (hex case is not
 /// identity; the mixed-case variant must not split into a second slot).
 fn freg(s: &mut std::net::TcpStream, st: &FabricState, req: &serde_json::Value) {
+    reply(s, run_freg(st, req));
+}
+
+/// run_freg — the encoding-free freg core (F4a): returns the ok payload or
+/// the verbatim "NNN text" refusal, so the legacy JSON verbs and the rpc2
+/// CBOR family (Peer.FabricReg) execute ONE semantic path. The refusal
+/// strings ARE the wire contract; changing one is a spec change.
+fn run_freg(st: &FabricState, req: &serde_json::Value) -> Result<serde_json::Value, String> {
     let Some(h) = req.get("handle").and_then(|v| v.as_str()) else {
-        let _ = write_frame(s, &frame_err("400 freg needs handle"));
-        return;
+        return Err("400 freg needs handle".to_string());
     };
     if !hex::decode(h).map(|b| b.len() == 32).unwrap_or(false) {
-        let _ = write_frame(s, &frame_err("400 handle must be 32-byte hex"));
-        return;
+        return Err("400 handle must be 32-byte hex".to_string());
     }
     let h = h.to_lowercase();
     let Some(token) = req.get("token").and_then(|v| v.as_str()) else {
-        let _ = write_frame(s, &frame_err("400 freg needs token"));
-        return;
+        return Err("400 freg needs token".to_string());
     };
     if !(16..=128).contains(&token.len()) {
-        let _ = write_frame(s, &frame_err("400 token must be 16..=128 bytes"));
-        return;
+        return Err("400 token must be 16..=128 bytes".to_string());
     }
     let now = now_sec();
     let lease = req.get("lease").and_then(|v| v.as_u64()).unwrap_or(3600);
@@ -399,14 +415,12 @@ fn freg(s: &mut std::net::TcpStream, st: &FabricState, req: &serde_json::Value) 
         let cur_token = reg.get(&h).map(|c| c.token.clone()).unwrap_or_default();
         let prev = req.get("prev_token").and_then(|v| v.as_str()).unwrap_or("");
         if !ct_eq(&cur_token, prev) {
-            let _ = write_frame(s, &frame_err("403 live registration: prev_token required"));
-            return;
+            return Err("403 live registration: prev_token required".to_string());
         }
     } else if reg.len() >= st.cfg.max_regs {
         // Unauthenticated verb: the cap — not memory growth — is the DoS
         // answer. Full budget of live regs → refuse; new regs evict nothing.
-        let _ = write_frame(s, &frame_err("503 fabric registry full"));
-        return;
+        return Err("503 fabric registry full".to_string());
     }
     reg.insert(
         h,
@@ -416,8 +430,7 @@ fn freg(s: &mut std::net::TcpStream, st: &FabricState, req: &serde_json::Value) 
         },
     );
     drop(reg);
-    let body = serde_json::json!({ "token": token, "expires": expires });
-    let _ = write_frame(s, &frame_ok(body.to_string().as_bytes()));
+    Ok(serde_json::json!({ "token": token, "expires": expires }))
 }
 
 /// fput {handle, pointer_hex, deadline} → 0x00 {queued} | 404 | 410 | 429
@@ -441,42 +454,44 @@ fn fput(
     dir: &str,
     ip: &str,
 ) {
+    reply(s, run_fput(st, req, dir, ip));
+}
+
+/// run_fput — the encoding-free fput core (F4a): one semantic path for the
+/// legacy JSON verb and Peer.FabricPut alike.
+fn run_fput(
+    st: &FabricState,
+    req: &serde_json::Value,
+    dir: &str,
+    ip: &str,
+) -> Result<serde_json::Value, String> {
     let Some(h) = req.get("handle").and_then(|v| v.as_str()) else {
-        let _ = write_frame(s, &frame_err("400 fput needs handle"));
-        return;
+        return Err("400 fput needs handle".to_string());
     };
     if h.len() != 64 {
         // Hex lowercase or uppercase both decode to 32 bytes; 64 chars is
         // the exact length — refuse everything else before decoding.
-        let _ = write_frame(s, &frame_err("400 handle must be 32-byte hex"));
-        return;
+        return Err("400 handle must be 32-byte hex".to_string());
     }
     let h = h.to_lowercase();
     {
         let reg = st.reg.lock().unwrap();
         match reg.get(&h) {
-            None => {
-                let _ = write_frame(s, &frame_err("404 unknown handle"));
-                return;
-            }
+            None => return Err("404 unknown handle".to_string()),
             Some(r) if r.expires <= now_sec() => {
-                let _ = write_frame(s, &frame_err("404 handle lease expired"));
-                return;
+                return Err("404 handle lease expired".to_string());
             }
             Some(_) => {}
         }
     }
     if !st.fput_limiter.allow(ip, now_sec()) {
-        let _ = write_frame(s, &frame_err("429 fput rate"));
-        return;
+        return Err("429 fput rate".to_string());
     }
     let Some(ptr_hex) = req.get("pointer_hex").and_then(|v| v.as_str()) else {
-        let _ = write_frame(s, &frame_err("400 fput needs pointer_hex"));
-        return;
+        return Err("400 fput needs pointer_hex".to_string());
     };
     if ptr_hex.len() != 2 * POINTER_LEN {
-        let _ = write_frame(s, &frame_err("400 pointer must be 74-byte hex"));
-        return;
+        return Err("400 pointer must be 74-byte hex".to_string());
     }
     let pointer = match hex::decode(ptr_hex) {
         Ok(p) if p.len() == POINTER_LEN => {
@@ -484,32 +499,25 @@ fn fput(
             a.copy_from_slice(&p);
             a
         }
-        _ => {
-            let _ = write_frame(s, &frame_err("400 pointer must be 74-byte hex"));
-            return;
-        }
+        _ => return Err("400 pointer must be 74-byte hex".to_string()),
     };
     if pointer[0] != 1 || pointer[1] != 0 {
-        let _ = write_frame(s, &frame_err("400 bad pointer payload header"));
-        return;
+        return Err("400 bad pointer payload header".to_string());
     }
     let deadline = u64::from_le_bytes(pointer[66..74].try_into().unwrap());
     if deadline == 0 {
-        let _ = write_frame(s, &frame_err("400 zero pointer deadline"));
-        return;
+        return Err("400 zero pointer deadline".to_string());
     }
     let now = now_sec();
     if deadline <= now {
-        let _ = write_frame(s, &frame_err("410 gone"));
-        return;
+        return Err("410 gone".to_string());
     }
     // Horizon cap (AUDIT-RELAYFABRIC H-N1): every compost path is
     // deadline-triggered, so a far-future deadline is an immortal envelope —
     // unbounded disk and index growth that survives restarts. Cap it at fput
     // with the same error family as the body store's own horizon discipline.
     if deadline > now + st.cfg.max_deadline_horizon_sec {
-        let _ = write_frame(s, &frame_err("400 deadline beyond horizon cap"));
-        return;
+        return Err("400 deadline beyond horizon cap".to_string());
     }
     let env = Envelope {
         handle: {
@@ -524,10 +532,7 @@ fn fput(
     let mut ec = Sha256::new();
     ec.update(raw);
     let env_cid_hex = hex::encode(ec.finalize());
-    if let Err(e) = FabricState::persist_envelope(dir, &env_cid_hex, &raw) {
-        let _ = write_frame(s, &frame_err(&e));
-        return;
-    }
+    FabricState::persist_envelope(dir, &env_cid_hex, &raw)?;
     let mut queues = st.queues.lock().unwrap();
     let q = queues.entry(h.to_string()).or_default();
     if let Some(old) = q.iter_mut().find(|x| x.pointer == pointer) {
@@ -566,7 +571,7 @@ fn fput(
             true
         }
     });
-    let _ = write_frame(s, &frame_ok(b"{\"queued\":true}"));
+    Ok(serde_json::json!({ "queued": true }))
 }
 
 /// fpop {handle, token, max} → 0x00 {pointers: [...]} | 404 | 403
@@ -586,29 +591,35 @@ fn fpop(
     dir: &str,
     ip: &str,
 ) {
+    reply(s, run_fpop(st, req, dir, ip));
+}
+
+/// run_fpop — the encoding-free fpop core (F4a): one semantic path for the
+/// legacy JSON verb and Peer.FabricPop alike.
+fn run_fpop(
+    st: &FabricState,
+    req: &serde_json::Value,
+    dir: &str,
+    ip: &str,
+) -> Result<serde_json::Value, String> {
     let Some(h) = req.get("handle").and_then(|v| v.as_str()) else {
-        let _ = write_frame(s, &frame_err("400 fpop needs handle"));
-        return;
+        return Err("400 fpop needs handle".to_string());
     };
     if h.len() != 64 {
-        let _ = write_frame(s, &frame_err("400 handle must be 32-byte hex"));
-        return;
+        return Err("400 handle must be 32-byte hex".to_string());
     }
     let h = h.to_lowercase();
     let token = req.get("token").and_then(|v| v.as_str()).unwrap_or("");
     let max = req.get("max").and_then(|v| v.as_u64()).unwrap_or(8).min(64) as usize;
     if !st.fput_limiter.allow(ip, now_sec()) {
-        let _ = write_frame(s, &frame_err("429 fpop rate"));
-        return;
+        return Err("429 fpop rate".to_string());
     }
     let reg = st.reg.lock().unwrap();
     let Some(r) = reg.get(&h) else {
-        let _ = write_frame(s, &frame_err("404 unknown handle"));
-        return;
+        return Err("404 unknown handle".to_string());
     };
     if r.expires <= now_sec() || !ct_eq(&r.token, token) {
-        let _ = write_frame(s, &frame_err("403 wrong token"));
-        return;
+        return Err("403 wrong token".to_string());
     }
     drop(reg);
     let now = now_sec();
@@ -624,8 +635,98 @@ fn fpop(
             // else: expired while queued — composted, not delivered.
         }
     }
-    let body = serde_json::json!({ "pointers": out });
-    let _ = write_frame(s, &frame_ok(body.to_string().as_bytes()));
+    Ok(serde_json::json!({ "pointers": out }))
+}
+
+/// handle_rpc2_fabric — the rpc2/CBOR face of the same three cores (F4a;
+/// RELAY_FABRIC_F4.md §1): Peer.FabricReg / Peer.FabricPut / Peer.FabricPop.
+/// Framing is spore-peer's rpc2 subset (LE32 length + CBOR header {M,S,E} +
+/// one CBOR payload item); refusals keep the legacy "NNN text" discipline in
+/// the header's E field with no payload. The byte-exact request/response
+/// frames for all three methods are pinned in docs/interop-vectors.json
+/// fabric_v1.rpc2_* — an encoder or decoder that disagrees on any byte fails
+/// the conformance tests on BOTH sides. Same socket, same dispatch point as
+/// the legacy verbs; the rpc2 and JSON families stay disjoint because a
+/// legacy JSON request never decodes as an rpc2 header map.
+pub fn handle_rpc2_fabric(
+    s: &mut std::net::TcpStream,
+    msg: &super::p2p::Rpc2Message,
+    dir: &str,
+    cfg: &ServeConfig,
+    ip: &str,
+) {
+    let Some(st) = cfg.fabric.as_ref() else {
+        let _ = write_frame(
+            s,
+            &super::p2p::error_response(msg.seq, "501 fabric disabled"),
+        );
+        return;
+    };
+    let verb = match msg.method.as_str() {
+        "Peer.FabricReg" => "freg",
+        "Peer.FabricPut" => "fput",
+        "Peer.FabricPop" => "fpop",
+        other => {
+            let _ = write_frame(
+                s,
+                &super::p2p::error_response(
+                    msg.seq,
+                    &format!("400 bad fabric rpc2 method {other}"),
+                ),
+            );
+            return;
+        }
+    };
+    // The cores read serde_json values; the CBOR payload decodes into exactly
+    // the same JSON shape (maps/text/uints), so one path feeds both encodings.
+    let req = msg.payload.clone();
+    let result = match verb {
+        "freg" => run_freg(st, &req),
+        "fput" => run_fput(st, &req, dir, ip),
+        _ => run_fpop(st, &req, dir, ip),
+    };
+    match result {
+        Ok(body) => {
+            let payload = json_to_cbor(&body);
+            let _ = write_frame(s, &super::p2p::cbor::message("", msg.seq, "", payload));
+        }
+        Err(e) => {
+            let _ = write_frame(s, &super::p2p::error_response(msg.seq, &e));
+        }
+    }
+}
+
+/// json_to_cbor encodes the cores' serde_json payloads into the rpc2 CBOR
+/// subset (maps with text keys, text, uints, arrays, bools). Fabric payloads
+/// are closed over those types; anything else cannot occur from the cores.
+fn json_to_cbor(v: &serde_json::Value) -> Vec<u8> {
+    use super::p2p::cbor;
+    match v {
+        serde_json::Value::Object(m) => {
+            let mut out = cbor::map(m.len());
+            for (k, item) in m {
+                out.extend_from_slice(&cbor::kv(k, &json_to_cbor(item)));
+            }
+            out
+        }
+        serde_json::Value::Array(a) => {
+            let mut out = cbor::array(a.len());
+            for item in a {
+                out.extend_from_slice(&json_to_cbor(item));
+            }
+            out
+        }
+        serde_json::Value::String(t) => cbor::text(t),
+        serde_json::Value::Number(n) => cbor::uint(n.as_u64().unwrap_or(0)),
+        serde_json::Value::Bool(b) => {
+            if *b {
+                cbor::head(7, 20)
+            } else {
+                cbor::head(7, 19)
+            }
+        }
+        _ => cbor::head(7, 22), // null
+    }
 }
 
 #[cfg(test)]
@@ -709,6 +810,139 @@ mod tests {
                 .is_err(),
             "short pointer must fail"
         );
+    }
+
+    /// Vectors-first conformance for the rpc2/CBOR method family (F4a): the
+    /// byte-exact frames in fabric_v1.rpc2_* were generated by the Go codec;
+    /// Rust must reproduce them exactly and decode the pinned responses.
+    /// The cores' byte-level framing (LE32 + CBOR header {M,S,E} + payload)
+    /// cannot drift on either side without failing here.
+    #[test]
+    fn fabric_rpc2_vectors_conformance() {
+        let Some(p) = vectors_path() else { return };
+        let raw = std::fs::read_to_string(p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let fv = &v["fabric_v1"];
+
+        let handle = field(fv, "handle_hex");
+        let token = field(fv, "reg_token_hex");
+        let pointer = field(fv, "pointer_hex");
+
+        // Encode the three requests + the error response with THIS crate's
+        // codec (spore_peer::p2p::cbor) and compare to the pinned frames.
+        let put_req = {
+            let mut m = super::super::p2p::cbor::map(3);
+            m.extend_from_slice(&super::super::p2p::cbor::kv(
+                "handle",
+                &super::super::p2p::cbor::text(handle),
+            ));
+            m.extend_from_slice(&super::super::p2p::cbor::kv(
+                "pointer_hex",
+                &super::super::p2p::cbor::text(pointer),
+            ));
+            m.extend_from_slice(&super::super::p2p::cbor::kv(
+                "deadline",
+                &super::super::p2p::cbor::uint(4102444800),
+            ));
+            rpc2_frame_hex("Peer.FabricPut", 1, &m)
+        };
+        assert_eq!(
+            put_req,
+            field(fv, "rpc2_request_fput_frame_hex"),
+            "fput request frame"
+        );
+
+        let pop_req = {
+            let mut m = super::super::p2p::cbor::map(3);
+            m.extend_from_slice(&super::super::p2p::cbor::kv(
+                "handle",
+                &super::super::p2p::cbor::text(handle),
+            ));
+            m.extend_from_slice(&super::super::p2p::cbor::kv(
+                "token",
+                &super::super::p2p::cbor::text(token),
+            ));
+            m.extend_from_slice(&super::super::p2p::cbor::kv(
+                "max",
+                &super::super::p2p::cbor::uint(64),
+            ));
+            rpc2_frame_hex("Peer.FabricPop", 2, &m)
+        };
+        assert_eq!(
+            pop_req,
+            field(fv, "rpc2_request_fpop_frame_hex"),
+            "fpop request frame"
+        );
+
+        let reg_req = {
+            let mut m = super::super::p2p::cbor::map(4);
+            m.extend_from_slice(&super::super::p2p::cbor::kv(
+                "handle",
+                &super::super::p2p::cbor::text(handle),
+            ));
+            m.extend_from_slice(&super::super::p2p::cbor::kv(
+                "token",
+                &super::super::p2p::cbor::text(token),
+            ));
+            m.extend_from_slice(&super::super::p2p::cbor::kv(
+                "nonce",
+                &super::super::p2p::cbor::text("spore-fabric-vectors"),
+            ));
+            m.extend_from_slice(&super::super::p2p::cbor::kv(
+                "lease",
+                &super::super::p2p::cbor::uint(3600),
+            ));
+            rpc2_frame_hex("Peer.FabricReg", 3, &m)
+        };
+        assert_eq!(
+            reg_req,
+            field(fv, "rpc2_request_freg_frame_hex"),
+            "freg request frame"
+        );
+
+        let err_frame = {
+            let payload = super::super::p2p::error_response(4, "503 registry full");
+            let mut f = Vec::with_capacity(4 + payload.len());
+            f.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            f.extend_from_slice(&payload);
+            hex::encode(f)
+        };
+        assert_eq!(
+            err_frame,
+            field(fv, "rpc2_response_error_frame_hex"),
+            "error response frame"
+        );
+
+        // Decode the pinned ok responses and verify the payload semantics.
+        // The pinned frames carry the LE32 length prefix (the wire form);
+        // decode_message expects the post-read_frame payload, so strip it.
+        let put_resp = hex::decode(field(fv, "rpc2_response_fput_frame_hex")).unwrap();
+        let msg = super::super::p2p::decode_message(&put_resp[4..]).expect("fput response decodes");
+        assert_eq!(msg.seq, 1);
+        assert_eq!(msg.payload["queued"], serde_json::json!(true));
+
+        let pop_resp = hex::decode(field(fv, "rpc2_response_fpop_frame_hex")).unwrap();
+        let msg = super::super::p2p::decode_message(&pop_resp[4..]).expect("fpop response decodes");
+        assert_eq!(msg.seq, 2);
+        assert_eq!(msg.payload["pointers"][0], serde_json::json!(pointer));
+
+        let reg_resp = hex::decode(field(fv, "rpc2_response_freg_frame_hex")).unwrap();
+        let msg = super::super::p2p::decode_message(&reg_resp[4..]).expect("freg response decodes");
+        assert_eq!(msg.seq, 3);
+        assert_eq!(msg.payload["token"], serde_json::json!(token));
+    }
+
+    /// rpc2_frame_hex — build one full rpc2 frame (LE32 length prefix +
+    /// header map + body) with this crate's codec and hex-encode it, matching
+    /// the vector format. cbor::message and error_response return the RAW
+    /// payload — write_frame adds the length prefix at the socket boundary —
+    /// so the prefix is added here explicitly, mirroring the wire.
+    fn rpc2_frame_hex(method: &str, seq: u64, body: &[u8]) -> String {
+        let payload = super::super::p2p::cbor::message(method, seq, "", body.to_vec());
+        let mut f = Vec::with_capacity(4 + payload.len());
+        f.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        f.extend_from_slice(&payload);
+        hex::encode(f)
     }
 
     // --- end-to-end verb tests over real sockets ---

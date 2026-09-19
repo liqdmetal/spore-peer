@@ -509,7 +509,15 @@ fn handle_client(
         // frame never decodes as an rpc2 message and misdispatch is impossible.
         if let Some(msg) = decode_message(&body) {
             if !msg.method.is_empty() {
-                handle_rpc2(s, &msg, dir, &ip, cfg, limiter);
+                // Fabric rpc2 methods (Peer.FabricReg/Put/Pop, F4a) share the
+                // dispatch point with the sync subset: same cores as the
+                // legacy JSON verbs, CBOR encoding, same -fabric gate (the
+                // handler answers 501 fabric disabled when the flag is off).
+                if msg.method.starts_with("Peer.Fabric") {
+                    fabric::handle_rpc2_fabric(s, &msg, dir, cfg, &ip);
+                } else {
+                    handle_rpc2(s, &msg, dir, &ip, cfg, limiter);
+                }
                 continue;
             }
         }
