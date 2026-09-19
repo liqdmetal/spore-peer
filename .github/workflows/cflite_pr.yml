@@ -1,0 +1,64 @@
+name: ClusterFuzzLite PR fuzzing
+
+# Rust half of the cross-binary decoder fuzzing (mirrors spore's
+# cflite_pr.yml). Mode 'code-change' runs the fuzzer over the PR with the
+# batch-produced corpus as its starting point and reports only findings
+# that reproduce on main too.
+#
+# Storage: PR fuzzing only ever READS — it downloads the batch corpus from
+# the cfl-corpus branch so PR fuzzing starts from accumulated structure.
+# It never uploads (code-change mode has no corpus upload), so this
+# workflow keeps permissions: read-all while batch/cron carry contents:
+# write for their uploads.
+
+on:
+  pull_request:
+    paths:
+      # Build + fuzz only when the fuzzed code or its build recipe changed;
+      # docs-only PRs do not need a fuzz bill.
+      - 'src/**'
+      - 'tests/**'
+      - 'fuzz/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.clusterfuzzlite/**'
+      - '.github/workflows/cflite_pr.yml'
+
+permissions: read-all
+
+jobs:
+  PR:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-${{ matrix.sanitizer }}-${{ github.ref }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer:
+        - address
+    steps:
+    - name: Build Fuzzers (${{ matrix.sanitizer }})
+      id: build
+      uses: google/clusterfuzzlite/actions/build_fuzzers@v1
+      with:
+        language: rust
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        sanitizer: ${{ matrix.sanitizer }}
+
+    - name: Run Fuzzers (${{ matrix.sanitizer }})
+      id: run
+      uses: google/clusterfuzzlite/actions/run_fuzzers@v1
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        fuzz-seconds: 600
+        mode: 'code-change'
+        sanitizer: ${{ matrix.sanitizer }}
+        # output-sarif stays at its false default: uploading to code scanning
+        # needs security-events: write, which the read-all grant above
+        # deliberately does not carry. Findings fail the check itself — that
+        # is the gate; SARIF annotations would be a second surface.
+        # Storage (read-only from this workflow): start from the batch
+        # corpus instead of cold seeds. No upload happens in this mode.
+        storage-repo: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/liqdmetal/spore-peer.git
+        storage-repo-branch: cfl-corpus

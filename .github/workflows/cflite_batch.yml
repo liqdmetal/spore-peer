@@ -1,0 +1,55 @@
+name: ClusterFuzzLite batch fuzzing
+
+# Rust half of the cross-binary decoder fuzzing (mirrors spore's
+# cflite_batch.yml, which owns the Go half). Batch mode: continuous
+# fuzzing of main so a corpus builds up over time.
+#
+# Storage: corpora persist to the cfl-corpus branch of THIS repo (same-repo
+# storage per the docs' "Git repo for storage" section — no PAT needed when
+# the storage repo is the workflow's own repo, so the default token carries
+# exactly one repo's write scope instead of a repo-scoped PAT's all-repo
+# scope). Git history is the retention mechanism: nothing expires at 90
+# days the way run artifacts do.
+#
+# Schedule is offset one hour from spore's (03:10 UTC) and the cron
+# housekeeping (09:00 UTC vs 08:00) so the two repos' fuzzing jobs never
+# collide on shared runners.
+
+on:
+  schedule:
+    - cron: '10 4 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  # read-all + the storage write: batch mode uploads the corpus to the
+  # cfl-corpus branch. contents: write is scoped to this repo only.
+  contents: write
+
+jobs:
+  BatchFuzzing:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer:
+        - address
+    steps:
+    - name: Build Fuzzers (${{ matrix.sanitizer }})
+      id: build
+      uses: google/clusterfuzzlite/actions/build_fuzzers@v1
+      with:
+        language: rust
+        sanitizer: ${{ matrix.sanitizer }}
+
+    - name: Run Fuzzers (${{ matrix.sanitizer }})
+      id: run
+      uses: google/clusterfuzzlite/actions/run_fuzzers@v1
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        fuzz-seconds: 3600
+        mode: 'batch'
+        sanitizer: ${{ matrix.sanitizer }}
+        # Storage: same-repo branch (see header). Token embedded in the URL
+        # per the docs' storage pattern; GitHub masks GITHUB_TOKEN in logs.
+        storage-repo: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/liqdmetal/spore-peer.git
+        storage-repo-branch: cfl-corpus

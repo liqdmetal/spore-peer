@@ -104,6 +104,15 @@ decodes to).
 - **CI:** a 2-minute `cargo fuzz run` smoke job on every push/PR (ubuntu,
   nightly). A crasher lands in `fuzz/artifacts/` — fold it into the corpus
   as a seed alongside the fix so it can never regress unnoticed.
+- **ClusterFuzzLite (continuous):** the same target runs as a CFL batch
+  job daily (04:10 UTC) with a real 1h fuzz budget, a nightly prune, and a
+  coverage report published to gh-pages. Corpora persist on the
+  machine-generated `cfl-corpus` branch — git history is the retention
+  mechanism, nothing expires at 90 days the way run artifacts do. PRs
+  touching `src/`, `fuzz/`, or the build recipe get a 10-minute
+  code-change fuzz starting from the accumulated corpus. Build recipe:
+  `.clusterfuzzlite/` (mirrors spore's Go half — together the two
+  clusters fuzz both decoders of the cross-binary wire contract).
 
 ## Commits
 
