@@ -22,7 +22,13 @@ if [ ! -d fuzz/corpus/fuzz_p2p_decode ] || [ -z "$(ls -A fuzz/corpus/fuzz_p2p_de
 fi
 
 mkdir -p $OUT
-zip -q -j $OUT/fuzz_p2p_decode_fuzzer_seed_corpus.zip fuzz/corpus/fuzz_p2p_decode/*
+# Seed-corpus zip naming is a RUNNER contract, not cosmetic: base-runner's
+# run_fuzzer looks for exactly "${FUZZER}_seed_corpus.zip" where FUZZER is
+# the binary name (fuzz_p2p_decode), then unzips it into the fuzzing corpus
+# dir before exec. The natural cargo-fuzz crate name has no _fuzzer suffix,
+# so the zip must not have one either — a mismatched name builds fine and
+# silently never loads (batch mode then starts from an empty corpus).
+zip -q -j $OUT/fuzz_p2p_decode_seed_corpus.zip fuzz/corpus/fuzz_p2p_decode/*
 
 # -O: the libfuzzer-sys build applies -Cpanic=abort + sanitizer+coverage
 # instrumentation against the image's pinned nightly; release profile keeps
