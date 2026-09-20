@@ -113,6 +113,15 @@ decodes to).
   code-change fuzz starting from the accumulated corpus. Build recipe:
   `.clusterfuzzlite/` (mirrors spore's Go half — together the two
   clusters fuzz both decoders of the cross-binary wire contract).
+  - Coverage dashboard (Rust decoder):
+    <https://liqdmetal.github.io/spore-peer/coverage/latest/report/linux/index.html>
+    (published from the `gh-pages` branch by the nightly cron; Go-half
+    dashboard: <https://liqdmetal.github.io/spore/coverage/latest/report/index.html>).
+  - Corpus: the `cfl-corpus` branch, `corpus/fuzz_p2p_decode/` — pull a
+    crashing-interesting subset locally with
+    `git fetch origin cfl-corpus && git show origin/cfl-corpus:corpus/fuzz_p2p_decode/<file> > case.bin`.
+  - Wire-spec side of the story (which parser surfaces each repo's targets
+    cover): spore's `docs/WIRE_SPEC.md` §9.
 
 ## Commits
 
