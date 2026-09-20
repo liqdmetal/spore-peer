@@ -66,6 +66,12 @@ jobs:
         fuzz-seconds: 600
         mode: 'coverage'
         sanitizer: 'coverage'
+        # run_fuzzers carries its own language input (it does not inherit
+        # build_fuzzers'). The coverage script's default c++ path happens to
+        # work for libfuzzer-sys binaries — they export LLVMFuzzerTestOneInput
+        # — but rust is the honest input and keeps the report keyed to the
+        # right toolchain behavior.
+        language: rust
         storage-repo: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/liqdmetal/spore-peer.git
         storage-repo-branch: cfl-corpus
         # storage-repo-branch-coverage defaults to gh-pages — named here so
