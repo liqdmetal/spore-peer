@@ -25,6 +25,15 @@ permissions:
   # cfl-corpus branch. contents: write is scoped to this repo only.
   contents: write
 
+concurrency:
+  # One batch run at a time (same rationale as spore's cflite_batch.yml):
+  # GitHub's scheduler can deliver a cron firing hours late, and a delayed
+  # firing racing an operator dispatch would fail the second corpus upload
+  # to cfl-corpus on a non-fast-forward. Queuing keeps every firing's fuzz
+  # hours; a queued run still downloads the freshest corpus at its start.
+  group: cflite-batch
+  cancel-in-progress: false
+
 jobs:
   BatchFuzzing:
     runs-on: ubuntu-latest
