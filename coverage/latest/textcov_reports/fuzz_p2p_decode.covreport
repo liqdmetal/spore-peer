@@ -1,53 +1,53 @@
 _RINvCs7CSVwXiqia6_3hex14encode_to_iterNtNtCshDtJu3Ru83O_5alloc6string6StringECs2pf7BP1LhnP_10spore_peer:
-  133|  6.20k|fn encode_to_iter<T: iter::FromIterator<char>>(table: &'static [u8; 16], source: &[u8]) -> T {
-  134|  6.20k|    BytesToHexChars::new(source, table).collect()
-  135|  6.20k|}
+  133|  7.16k|fn encode_to_iter<T: iter::FromIterator<char>>(table: &'static [u8; 16], source: &[u8]) -> T {
+  134|  7.16k|    BytesToHexChars::new(source, table).collect()
+  135|  7.16k|}
 _RINvCs7CSVwXiqia6_3hex6encodeRShECs2pf7BP1LhnP_10spore_peer:
-  259|  6.20k|pub fn encode<T: AsRef<[u8]>>(data: T) -> String {
-  260|  6.20k|    data.encode_hex()
-  261|  6.20k|}
+  259|  7.16k|pub fn encode<T: AsRef<[u8]>>(data: T) -> String {
+  260|  7.16k|    data.encode_hex()
+  261|  7.16k|}
 _RINvXs1_Cs7CSVwXiqia6_3hexRShNtB6_5ToHex10encode_hexNtNtCshDtJu3Ru83O_5alloc6string6StringECs2pf7BP1LhnP_10spore_peer:
-  138|  6.20k|    fn encode_hex<U: iter::FromIterator<char>>(&self) -> U {
-  139|  6.20k|        encode_to_iter(HEX_CHARS_LOWER, self.as_ref())
-  140|  6.20k|    }
+  138|  7.16k|    fn encode_hex<U: iter::FromIterator<char>>(&self) -> U {
+  139|  7.16k|        encode_to_iter(HEX_CHARS_LOWER, self.as_ref())
+  140|  7.16k|    }
 _RNCNvXs_Cs7CSVwXiqia6_3hexNtB6_15BytesToHexCharsNtNtNtNtCs6SNw0SRvItZ_4core4iter6traits8iterator8Iterator4next0B6_:
-  108|  15.7k|            None => self.inner.next().map(|byte| {
-  109|  15.7k|                let current = self.table[(byte >> 4) as usize] as char;
-  110|  15.7k|                self.next = Some(self.table[(byte & 0x0F) as usize] as char);
-  111|  15.7k|                current
-  112|  15.7k|            }),
+  108|  22.8k|            None => self.inner.next().map(|byte| {
+  109|  22.8k|                let current = self.table[(byte >> 4) as usize] as char;
+  110|  22.8k|                self.next = Some(self.table[(byte & 0x0F) as usize] as char);
+  111|  22.8k|                current
+  112|  22.8k|            }),
 _RNvMCs7CSVwXiqia6_3hexNtB2_15BytesToHexChars3new:
-   93|  6.20k|    fn new(inner: &'a [u8], table: &'static [u8; 16]) -> BytesToHexChars<'a> {
-   94|  6.20k|        BytesToHexChars {
-   95|  6.20k|            inner: inner.iter(),
-   96|  6.20k|            table,
-   97|  6.20k|            next: None,
-   98|  6.20k|        }
-   99|  6.20k|    }
+   93|  7.16k|    fn new(inner: &'a [u8], table: &'static [u8; 16]) -> BytesToHexChars<'a> {
+   94|  7.16k|        BytesToHexChars {
+   95|  7.16k|            inner: inner.iter(),
+   96|  7.16k|            table,
+   97|  7.16k|            next: None,
+   98|  7.16k|        }
+   99|  7.16k|    }
 _RNvXs0_Cs7CSVwXiqia6_3hexNtB5_15BytesToHexCharsNtNtNtNtCs6SNw0SRvItZ_4core4iter6traits10exact_size17ExactSizeIterator3len:
-  123|  6.20k|    fn len(&self) -> usize {
-  124|  6.20k|        let mut length = self.inner.len() * 2;
-  125|  6.20k|        if self.next.is_some() {
+  123|  7.16k|    fn len(&self) -> usize {
+  124|  7.16k|        let mut length = self.inner.len() * 2;
+  125|  7.16k|        if self.next.is_some() {
   126|      0|            length += 1;
-  127|  6.20k|        }
-  128|  6.20k|        length
-  129|  6.20k|    }
+  127|  7.16k|        }
+  128|  7.16k|        length
+  129|  7.16k|    }
 _RNvXs_Cs7CSVwXiqia6_3hexNtB4_15BytesToHexCharsNtNtNtNtCs6SNw0SRvItZ_4core4iter6traits8iterator8Iterator4next:
-  105|  37.7k|    fn next(&mut self) -> Option<Self::Item> {
-  106|  37.7k|        match self.next.take() {
-  107|  15.7k|            Some(current) => Some(current),
-  108|  21.9k|            None => self.inner.next().map(|byte| {
+  105|  52.7k|    fn next(&mut self) -> Option<Self::Item> {
+  106|  52.7k|        match self.next.take() {
+  107|  22.8k|            Some(current) => Some(current),
+  108|  29.9k|            None => self.inner.next().map(|byte| {
   109|       |                let current = self.table[(byte >> 4) as usize] as char;
   110|       |                self.next = Some(self.table[(byte & 0x0F) as usize] as char);
   111|       |                current
   112|       |            }),
   113|       |        }
-  114|  37.7k|    }
+  114|  52.7k|    }
 _RNvXs_Cs7CSVwXiqia6_3hexNtB4_15BytesToHexCharsNtNtNtNtCs6SNw0SRvItZ_4core4iter6traits8iterator8Iterator9size_hint:
-  116|  6.20k|    fn size_hint(&self) -> (usize, Option<usize>) {
-  117|  6.20k|        let length = self.len();
-  118|  6.20k|        (length, Some(length))
-  119|  6.20k|    }
+  116|  7.16k|    fn size_hint(&self) -> (usize, Option<usize>) {
+  117|  7.16k|        let length = self.len();
+  118|  7.16k|        (length, Some(length))
+  119|  7.16k|    }
 
 LLVMFuzzerInitialize:
   252|      2|            pub extern "C" fn LLVMFuzzerInitialize(_argc: *const isize, _argv: *const *const *const u8) -> isize {
@@ -58,49 +58,49 @@ LLVMFuzzerInitialize:
   257|      2|                0
   258|      2|            }
 _RNvNvCslQ9OFrYrPUW_15fuzz_p2p_decode1__19___libfuzzer_sys_run:
-  293|    475|            fn __libfuzzer_sys_run($bytes: &[u8]) -> $rty {
+  293|    484|            fn __libfuzzer_sys_run($bytes: &[u8]) -> $rty {
   294|       |                $body
-  295|    475|            }
+  295|    484|            }
 rust_fuzzer_test_input:
-  261|    475|            pub extern "C" fn rust_fuzzer_test_input(bytes: &[u8]) -> i32 {
+  261|    484|            pub extern "C" fn rust_fuzzer_test_input(bytes: &[u8]) -> i32 {
   262|       |                // When `RUST_LIBFUZZER_DEBUG_PATH` is set, write the debug
   263|       |                // formatting of the input to that file. This is only intended for
   264|       |                // `cargo fuzz`'s use!
   265|       |
   266|       |                // `RUST_LIBFUZZER_DEBUG_PATH` is set in initialization.
-  267|    475|                if let Some(path) = $crate::rust_libfuzzer_debug_path() {
+  267|    484|                if let Some(path) = $crate::rust_libfuzzer_debug_path() {
   268|       |                    use std::io::Write;
   269|      0|                    let mut file = std::fs::File::create(path)
   270|      0|                        .expect("failed to create `RUST_LIBFUZZER_DEBUG_PATH` file");
   271|      0|                    writeln!(&mut file, "{:?}", bytes)
   272|      0|                        .expect("failed to write to `RUST_LIBFUZZER_DEBUG_PATH` file");
   273|      0|                    return 0;
-  274|    475|                }
+  274|    484|                }
   275|       |
-  276|    475|                let result = ::libfuzzer_sys::Corpus::from(__libfuzzer_sys_run(bytes));
-  277|    475|                result.to_libfuzzer_code()
-  278|    475|            }
+  276|    484|                let result = ::libfuzzer_sys::Corpus::from(__libfuzzer_sys_run(bytes));
+  277|    484|                result.to_libfuzzer_code()
+  278|    484|            }
 LLVMFuzzerTestOneInput:
-   59|    475|pub unsafe fn test_input_wrap(data: *const u8, size: usize) -> i32 {
-   60|    475|    let test_input = ::std::panic::catch_unwind(|| {
+   59|    484|pub unsafe fn test_input_wrap(data: *const u8, size: usize) -> i32 {
+   60|    484|    let test_input = ::std::panic::catch_unwind(|| {
    61|       |        let data_slice = ::std::slice::from_raw_parts(data, size);
    62|       |        rust_fuzzer_test_input(data_slice)
    63|       |    });
    64|       |
-   65|    475|    match test_input {
-   66|    475|        Ok(i) => i,
+   65|    484|    match test_input {
+   66|    484|        Ok(i) => i,
    67|       |        Err(_) => {
    68|       |            // hopefully the custom panic hook will be called before and abort the
    69|       |            // process before the stack frames are unwinded.
    70|      0|            ::std::process::abort();
    71|       |        }
    72|       |    }
-   73|    475|}
+   73|    484|}
 _RNCNvCskR0mjgiAqQq_13libfuzzer_sys15test_input_wrap0B3_:
-   60|    475|    let test_input = ::std::panic::catch_unwind(|| {
-   61|    475|        let data_slice = ::std::slice::from_raw_parts(data, size);
-   62|    475|        rust_fuzzer_test_input(data_slice)
-   63|    475|    });
+   60|    484|    let test_input = ::std::panic::catch_unwind(|| {
+   61|    484|        let data_slice = ::std::slice::from_raw_parts(data, size);
+   62|    484|        rust_fuzzer_test_input(data_slice)
+   63|    484|    });
 _RNCNvCskR0mjgiAqQq_13libfuzzer_sys25rust_libfuzzer_debug_path0B3_:
    78|      1|    RUST_LIBFUZZER_DEBUG_PATH.get_or_init(|| std::env::var("RUST_LIBFUZZER_DEBUG_PATH").ok())
 _RNvCskR0mjgiAqQq_13libfuzzer_sys10initialize:
@@ -121,100 +121,100 @@ _RNvCskR0mjgiAqQq_13libfuzzer_sys10initialize:
    96|      2|    0
    97|      2|}
 _RNvCskR0mjgiAqQq_13libfuzzer_sys25rust_libfuzzer_debug_path:
-   76|    475|pub fn rust_libfuzzer_debug_path() -> &'static Option<String> {
+   76|    484|pub fn rust_libfuzzer_debug_path() -> &'static Option<String> {
    77|       |    static RUST_LIBFUZZER_DEBUG_PATH: OnceLock<Option<String>> = OnceLock::new();
-   78|    475|    RUST_LIBFUZZER_DEBUG_PATH.get_or_init(|| std::env::var("RUST_LIBFUZZER_DEBUG_PATH").ok())
-   79|    475|}
+   78|    484|    RUST_LIBFUZZER_DEBUG_PATH.get_or_init(|| std::env::var("RUST_LIBFUZZER_DEBUG_PATH").ok())
+   79|    484|}
 _RNvMs_CskR0mjgiAqQq_13libfuzzer_sysNtB4_6Corpus17to_libfuzzer_code:
-   40|    475|    pub fn to_libfuzzer_code(self) -> i32 {
-   41|    475|        match self {
-   42|    475|            Corpus::Keep => 0,
+   40|    484|    pub fn to_libfuzzer_code(self) -> i32 {
+   41|    484|        match self {
+   42|    484|            Corpus::Keep => 0,
    43|      0|            Corpus::Reject => -1,
    44|       |        }
-   45|    475|    }
+   45|    484|    }
 _RNvXCskR0mjgiAqQq_13libfuzzer_sysNtB2_6CorpusINtNtCs6SNw0SRvItZ_4core7convert4FromuE4from:
-   30|    475|    fn from(_: ()) -> Self {
-   31|    475|        Self::Keep
-   32|    475|    }
+   30|    484|    fn from(_: ()) -> Self {
+   31|    484|        Self::Keep
+   32|    484|    }
 
 _RINvXs1G_NtNtCsaPevTP59vpk_10serde_core3ser5implsRNtNtCshDtJu3Ru83O_5alloc6string6StringNtB9_9Serialize9serializeNtNtNtCsdmkRQGfxVvc_10serde_json5value3ser10SerializerECs2pf7BP1LhnP_10spore_peer:
-  468|  6.20k|            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-  469|  6.20k|            where
-  470|  6.20k|                S: Serializer,
+  468|  7.16k|            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  469|  7.16k|            where
+  470|  7.16k|                S: Serializer,
   471|       |            {
-  472|  6.20k|                (**self).serialize(serializer)
-  473|  6.20k|            }
+  472|  7.16k|                (**self).serialize(serializer)
+  473|  7.16k|            }
 _RINvXs_NtNtCsaPevTP59vpk_10serde_core3ser5implsNtNtCshDtJu3Ru83O_5alloc6string6StringNtB7_9Serialize9serializeNtNtNtCsdmkRQGfxVvc_10serde_json5value3ser10SerializerECs2pf7BP1LhnP_10spore_peer:
-   54|  6.20k|    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-   55|  6.20k|    where
-   56|  6.20k|        S: Serializer,
+   54|  7.16k|    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+   55|  7.16k|    where
+   56|  7.16k|        S: Serializer,
    57|       |    {
-   58|  6.20k|        serializer.serialize_str(self)
-   59|  6.20k|    }
+   58|  7.16k|        serializer.serialize_str(self)
+   59|  7.16k|    }
 _RINvXNtNtCsaPevTP59vpk_10serde_core3ser5implseNtB5_9Serialize9serializeNtNtNtCsdmkRQGfxVvc_10serde_json5value3ser10SerializerECs2pf7BP1LhnP_10spore_peer:
-   42|  10.5k|    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-   43|  10.5k|    where
-   44|  10.5k|        S: Serializer,
+   42|  12.8k|    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+   43|  12.8k|    where
+   44|  12.8k|        S: Serializer,
    45|       |    {
-   46|  10.5k|        serializer.serialize_str(self)
-   47|  10.5k|    }
+   46|  12.8k|        serializer.serialize_str(self)
+   47|  12.8k|    }
 _RINvXs1G_NtNtCsaPevTP59vpk_10serde_core3ser5implsRReNtB9_9Serialize9serializeNtNtNtCsdmkRQGfxVvc_10serde_json5value3ser10SerializerECs2pf7BP1LhnP_10spore_peer:
-  468|  10.5k|            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-  469|  10.5k|            where
-  470|  10.5k|                S: Serializer,
+  468|  12.8k|            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  469|  12.8k|            where
+  470|  12.8k|                S: Serializer,
   471|       |            {
-  472|  10.5k|                (**self).serialize(serializer)
-  473|  10.5k|            }
+  472|  12.8k|                (**self).serialize(serializer)
+  473|  12.8k|            }
 _RINvXs1G_NtNtCsaPevTP59vpk_10serde_core3ser5implsReNtB9_9Serialize9serializeNtNtNtCsdmkRQGfxVvc_10serde_json5value3ser10SerializerECs2pf7BP1LhnP_10spore_peer:
-  468|  10.5k|            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-  469|  10.5k|            where
-  470|  10.5k|                S: Serializer,
+  468|  12.8k|            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  469|  12.8k|            where
+  470|  12.8k|                S: Serializer,
   471|       |            {
-  472|  10.5k|                (**self).serialize(serializer)
-  473|  10.5k|            }
+  472|  12.8k|                (**self).serialize(serializer)
+  473|  12.8k|            }
 _RINvXs1G_NtNtCsaPevTP59vpk_10serde_core3ser5implsRxNtB9_9Serialize9serializeNtNtNtCsdmkRQGfxVvc_10serde_json5value3ser10SerializerECs2pf7BP1LhnP_10spore_peer:
-  468|  3.59k|            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-  469|  3.59k|            where
-  470|  3.59k|                S: Serializer,
+  468|  3.68k|            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  469|  3.68k|            where
+  470|  3.68k|                S: Serializer,
   471|       |            {
-  472|  3.59k|                (**self).serialize(serializer)
-  473|  3.59k|            }
+  472|  3.68k|                (**self).serialize(serializer)
+  473|  3.68k|            }
 _RINvXs1G_NtNtCsaPevTP59vpk_10serde_core3ser5implsRyNtB9_9Serialize9serializeNtNtNtCsdmkRQGfxVvc_10serde_json5value3ser10SerializerECs2pf7BP1LhnP_10spore_peer:
-  468|  16.4k|            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-  469|  16.4k|            where
-  470|  16.4k|                S: Serializer,
+  468|  17.3k|            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  469|  17.3k|            where
+  470|  17.3k|                S: Serializer,
   471|       |            {
-  472|  16.4k|                (**self).serialize(serializer)
-  473|  16.4k|            }
+  472|  17.3k|                (**self).serialize(serializer)
+  473|  17.3k|            }
 _RINvXsC_NtNtCsaPevTP59vpk_10serde_core3ser5implsxNtB8_9Serialize9serializeNtNtNtCsdmkRQGfxVvc_10serde_json5value3ser10SerializerECs2pf7BP1LhnP_10spore_peer:
-   11|  3.59k|            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-   12|  3.59k|            where
-   13|  3.59k|                S: Serializer,
+   11|  3.68k|            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+   12|  3.68k|            where
+   13|  3.68k|                S: Serializer,
    14|       |            {
-   15|  3.59k|                serializer.$method(*self $($cast)*)
-   16|  3.59k|            }
+   15|  3.68k|                serializer.$method(*self $($cast)*)
+   16|  3.68k|            }
 _RINvXsI_NtNtCsaPevTP59vpk_10serde_core3ser5implsyNtB8_9Serialize9serializeNtNtNtCsdmkRQGfxVvc_10serde_json5value3ser10SerializerECs2pf7BP1LhnP_10spore_peer:
-   11|  16.4k|            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-   12|  16.4k|            where
-   13|  16.4k|                S: Serializer,
+   11|  17.3k|            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+   12|  17.3k|            where
+   13|  17.3k|                S: Serializer,
    14|       |            {
-   15|  16.4k|                serializer.$method(*self $($cast)*)
-   16|  16.4k|            }
+   15|  17.3k|                serializer.$method(*self $($cast)*)
+   16|  17.3k|            }
 
 _RNvXs1_NtCsdmkRQGfxVvc_10serde_json3mapINtB5_3MapNtNtCshDtJu3Ru83O_5alloc6string6StringNtNtB7_5value5ValueENtNtCs6SNw0SRvItZ_4core3cmp9PartialEq2eqCslQ9OFrYrPUW_15fuzz_p2p_decode:
-  411|    576|    fn eq(&self, other: &Self) -> bool {
-  412|    576|        self.map.eq(&other.map)
-  413|    576|    }
+  411|    568|    fn eq(&self, other: &Self) -> bool {
+  412|    568|        self.map.eq(&other.map)
+  413|    568|    }
 _RNvMNtCsdmkRQGfxVvc_10serde_json3mapINtB2_3MapNtNtCshDtJu3Ru83O_5alloc6string6StringNtNtB4_5value5ValueE3newCs2pf7BP1LhnP_10spore_peer:
-   41|  3.85k|    pub fn new() -> Self {
-   42|  3.85k|        Map {
-   43|  3.85k|            map: MapImpl::new(),
-   44|  3.85k|        }
-   45|  3.85k|    }
+   41|  3.84k|    pub fn new() -> Self {
+   42|  3.84k|        Map {
+   43|  3.84k|            map: MapImpl::new(),
+   44|  3.84k|        }
+   45|  3.84k|    }
 _RNvMNtCsdmkRQGfxVvc_10serde_json3mapINtB2_3MapNtNtCshDtJu3Ru83O_5alloc6string6StringNtNtB4_5value5ValueE6insertCs2pf7BP1LhnP_10spore_peer:
-  127|  8.68k|    pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
-  128|  8.68k|        self.map.insert(k, v)
-  129|  8.68k|    }
+  127|  10.5k|    pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
+  128|  10.5k|        self.map.insert(k, v)
+  129|  10.5k|    }
 _RINvMNtCsdmkRQGfxVvc_10serde_json3mapINtB3_3MapNtNtCshDtJu3Ru83O_5alloc6string6StringNtNtB5_5value5ValueE3geteEB5_:
    73|  1.45k|    pub fn get<Q>(&self, key: &Q) -> Option<&Value>
    74|  1.45k|    where
@@ -235,33 +235,33 @@ _RNvMs1_NtCsdmkRQGfxVvc_10serde_json6numberNtB5_6Number6as_u64:
   158|       |        self.n.parse().ok()
   159|      6|    }
 _RNvXNtCsdmkRQGfxVvc_10serde_json6numberNtB2_1NNtNtCs6SNw0SRvItZ_4core3cmp9PartialEq2eq:
-   38|  1.94k|    fn eq(&self, other: &Self) -> bool {
-   39|  1.94k|        match (self, other) {
-   40|  1.46k|            (N::PosInt(a), N::PosInt(b)) => a == b,
-   41|    479|            (N::NegInt(a), N::NegInt(b)) => a == b,
+   38|  1.93k|    fn eq(&self, other: &Self) -> bool {
+   39|  1.93k|        match (self, other) {
+   40|  1.45k|            (N::PosInt(a), N::PosInt(b)) => a == b,
+   41|    480|            (N::NegInt(a), N::NegInt(b)) => a == b,
    42|      0|            (N::Float(a), N::Float(b)) => a == b,
    43|      0|            _ => false,
    44|       |        }
-   45|  1.94k|    }
+   45|  1.93k|    }
 _RNvXsk_NtCsdmkRQGfxVvc_10serde_json6numberNtB5_6NumberINtNtCs6SNw0SRvItZ_4core7convert4FromyE4from:
-  746|  16.4k|                fn from(u: $ty) -> Self {
-  747|  16.4k|                    let n = {
+  746|  17.3k|                fn from(u: $ty) -> Self {
+  747|  17.3k|                    let n = {
   748|       |                        #[cfg(not(feature = "arbitrary_precision"))]
-  749|  16.4k|                        { N::PosInt(u as u64) }
+  749|  17.3k|                        { N::PosInt(u as u64) }
   750|       |                        #[cfg(feature = "arbitrary_precision")]
   751|       |                        {
   752|       |                            itoa::Buffer::new().format(u).to_owned()
   753|       |                        }
   754|       |                    };
-  755|  16.4k|                    Number { n }
-  756|  16.4k|                }
+  755|  17.3k|                    Number { n }
+  756|  17.3k|                }
 _RNvXsp_NtCsdmkRQGfxVvc_10serde_json6numberNtB5_6NumberINtNtCs6SNw0SRvItZ_4core7convert4FromxE4from:
-  768|  3.59k|                fn from(i: $ty) -> Self {
-  769|  3.59k|                    let n = {
+  768|  3.68k|                fn from(i: $ty) -> Self {
+  769|  3.68k|                    let n = {
   770|       |                        #[cfg(not(feature = "arbitrary_precision"))]
   771|       |                        {
-  772|  3.59k|                            if i < 0 {
-  773|  3.59k|                                N::NegInt(i as i64)
+  772|  3.68k|                            if i < 0 {
+  773|  3.68k|                                N::NegInt(i as i64)
   774|       |                            } else {
   775|      0|                                N::PosInt(i as u64)
   776|       |                            }
@@ -271,44 +271,44 @@ _RNvXsp_NtCsdmkRQGfxVvc_10serde_json6numberNtB5_6NumberINtNtCs6SNw0SRvItZ_4core7
   780|       |                            itoa::Buffer::new().format(i).to_owned()
   781|       |                        }
   782|       |                    };
-  783|  3.59k|                    Number { n }
-  784|  3.59k|                }
+  783|  3.68k|                    Number { n }
+  784|  3.68k|                }
 
 _RINvNtCsdmkRQGfxVvc_10serde_json5value8to_valueRNtNtCshDtJu3Ru83O_5alloc6string6StringECs2pf7BP1LhnP_10spore_peer:
-  995|  6.20k|pub fn to_value<T>(value: T) -> Result<Value, Error>
-  996|  6.20k|where
-  997|  6.20k|    T: Serialize,
+  995|  7.16k|pub fn to_value<T>(value: T) -> Result<Value, Error>
+  996|  7.16k|where
+  997|  7.16k|    T: Serialize,
   998|       |{
-  999|  6.20k|    value.serialize(Serializer)
- 1000|  6.20k|}
+  999|  7.16k|    value.serialize(Serializer)
+ 1000|  7.16k|}
 _RINvNtCsdmkRQGfxVvc_10serde_json5value8to_valueRReECs2pf7BP1LhnP_10spore_peer:
-  995|  10.5k|pub fn to_value<T>(value: T) -> Result<Value, Error>
-  996|  10.5k|where
-  997|  10.5k|    T: Serialize,
+  995|  12.8k|pub fn to_value<T>(value: T) -> Result<Value, Error>
+  996|  12.8k|where
+  997|  12.8k|    T: Serialize,
   998|       |{
-  999|  10.5k|    value.serialize(Serializer)
- 1000|  10.5k|}
+  999|  12.8k|    value.serialize(Serializer)
+ 1000|  12.8k|}
 _RINvNtCsdmkRQGfxVvc_10serde_json5value8to_valueRxECs2pf7BP1LhnP_10spore_peer:
-  995|  3.59k|pub fn to_value<T>(value: T) -> Result<Value, Error>
-  996|  3.59k|where
-  997|  3.59k|    T: Serialize,
+  995|  3.68k|pub fn to_value<T>(value: T) -> Result<Value, Error>
+  996|  3.68k|where
+  997|  3.68k|    T: Serialize,
   998|       |{
-  999|  3.59k|    value.serialize(Serializer)
- 1000|  3.59k|}
+  999|  3.68k|    value.serialize(Serializer)
+ 1000|  3.68k|}
 _RINvNtCsdmkRQGfxVvc_10serde_json5value8to_valueRyECs2pf7BP1LhnP_10spore_peer:
-  995|  16.4k|pub fn to_value<T>(value: T) -> Result<Value, Error>
-  996|  16.4k|where
-  997|  16.4k|    T: Serialize,
+  995|  17.3k|pub fn to_value<T>(value: T) -> Result<Value, Error>
+  996|  17.3k|where
+  997|  17.3k|    T: Serialize,
   998|       |{
-  999|  16.4k|    value.serialize(Serializer)
- 1000|  16.4k|}
+  999|  17.3k|    value.serialize(Serializer)
+ 1000|  17.3k|}
 _RNvMs0_NtCsdmkRQGfxVvc_10serde_json5valueNtB5_5Value6as_str:
-  492|  16.7k|    pub fn as_str(&self) -> Option<&str> {
-  493|  16.7k|        match self {
-  494|  8.69k|            Value::String(s) => Some(s),
-  495|  8.08k|            _ => None,
+  492|  19.3k|    pub fn as_str(&self) -> Option<&str> {
+  493|  19.3k|        match self {
+  494|  10.5k|            Value::String(s) => Some(s),
+  495|  8.73k|            _ => None,
   496|       |        }
-  497|  16.7k|    }
+  497|  19.3k|    }
 _RNvMs0_NtCsdmkRQGfxVvc_10serde_json5valueNtB5_5Value6as_u64:
   650|      9|    pub fn as_u64(&self) -> Option<u64> {
   651|      9|        match self {
@@ -317,124 +317,124 @@ _RNvMs0_NtCsdmkRQGfxVvc_10serde_json5valueNtB5_5Value6as_u64:
   654|       |        }
   655|      9|    }
 _RNvMs0_NtCsdmkRQGfxVvc_10serde_json5valueNtB5_5Value9as_object:
-  366|    502|    pub fn as_object(&self) -> Option<&Map<String, Value>> {
-  367|    502|        match self {
+  366|    503|    pub fn as_object(&self) -> Option<&Map<String, Value>> {
+  367|    503|        match self {
   368|    485|            Value::Object(map) => Some(map),
-  369|     17|            _ => None,
+  369|     18|            _ => None,
   370|       |        }
-  371|    502|    }
+  371|    503|    }
 
 _RNvXs_NtNtCsdmkRQGfxVvc_10serde_json5value3serNtB4_10SerializerNtNtCsaPevTP59vpk_10serde_core3ser10Serializer13serialize_strCs2pf7BP1LhnP_10spore_peer:
-  168|  16.7k|    fn serialize_str(self, value: &str) -> Result<Value> {
-  169|  16.7k|        Ok(Value::String(value.to_owned()))
-  170|  16.7k|    }
+  168|  20.0k|    fn serialize_str(self, value: &str) -> Result<Value> {
+  169|  20.0k|        Ok(Value::String(value.to_owned()))
+  170|  20.0k|    }
 _RNvXs_NtNtCsdmkRQGfxVvc_10serde_json5value3serNtB4_10SerializerNtNtCsaPevTP59vpk_10serde_core3ser10Serializer13serialize_u64Cs2pf7BP1LhnP_10spore_peer:
-  130|  16.4k|    fn serialize_u64(self, value: u64) -> Result<Value> {
-  131|  16.4k|        Ok(Value::Number(value.into()))
-  132|  16.4k|    }
+  130|  17.3k|    fn serialize_u64(self, value: u64) -> Result<Value> {
+  131|  17.3k|        Ok(Value::Number(value.into()))
+  132|  17.3k|    }
 _RNvXs_NtNtCsdmkRQGfxVvc_10serde_json5value3serNtB4_10SerializerNtNtCsaPevTP59vpk_10serde_core3ser10Serializer13serialize_i64:
-   92|  3.59k|    fn serialize_i64(self, value: i64) -> Result<Value> {
-   93|  3.59k|        Ok(Value::Number(value.into()))
-   94|  3.59k|    }
+   92|  3.68k|    fn serialize_i64(self, value: i64) -> Result<Value> {
+   93|  3.68k|        Ok(Value::Number(value.into()))
+   94|  3.68k|    }
 
 _RNvNtCs2pf7BP1LhnP_10spore_peer3p2p12decode_value:
-  205|  51.6k|fn decode_value(buf: &[u8], depth: usize) -> Option<(serde_json::Value, usize)> {
-  206|  51.6k|    if depth > MAX_DEPTH {
+  205|  56.2k|fn decode_value(buf: &[u8], depth: usize) -> Option<(serde_json::Value, usize)> {
+  206|  56.2k|    if depth > MAX_DEPTH {
   207|      1|        return None; // hostile nesting
-  208|  51.6k|    }
-  209|  51.6k|    let (&ib, rest) = buf.split_first()?;
-  210|  51.4k|    let major = ib >> 5;
-  211|  51.4k|    let info = ib & 0x1f;
-  212|  51.4k|    let (n, pos) = match info {
-  213|  51.4k|        0..=23 => (info as u64, 1usize),
-  214|    417|        24 => (*rest.first()? as u64, 2),
+  208|  56.2k|    }
+  209|  56.2k|    let (&ib, rest) = buf.split_first()?;
+  210|  56.1k|    let major = ib >> 5;
+  211|  56.1k|    let info = ib & 0x1f;
+  212|  56.1k|    let (n, pos) = match info {
+  213|  56.1k|        0..=23 => (info as u64, 1usize),
+  214|    419|        24 => (*rest.first()? as u64, 2),
   215|       |        25 => (
-  216|    303|            u16::from_be_bytes(rest.get(0..2)?.try_into().ok()?) as u64,
+  216|    282|            u16::from_be_bytes(rest.get(0..2)?.try_into().ok()?) as u64,
   217|       |            3,
   218|       |        ),
   219|       |        26 => (
-  220|    290|            u32::from_be_bytes(rest.get(0..4)?.try_into().ok()?) as u64,
+  220|    306|            u32::from_be_bytes(rest.get(0..4)?.try_into().ok()?) as u64,
   221|       |            5,
   222|       |        ),
-  223|    127|        27 => (u64::from_be_bytes(rest.get(0..8)?.try_into().ok()?), 9),
-  224|    129|        _ => return None, // indefinite length (info 31) and reserved infos
+  223|    134|        27 => (u64::from_be_bytes(rest.get(0..8)?.try_into().ok()?), 9),
+  224|    132|        _ => return None, // indefinite length (info 31) and reserved infos
   225|       |    };
-  226|  51.3k|    match major {
-  227|  16.4k|        0 => Some((serde_json::json!(n), pos)),
+  226|  55.9k|    match major {
+  227|  17.3k|        0 => Some((serde_json::json!(n), pos)),
   228|       |        1 => {
   229|       |            // CBOR negint = -1 - n. Magnitudes below i64::MIN would panic
   230|       |            // serde_json's number conversion (found by the fuzz corpus):
   231|       |            // reject instead — the rpc2 subset never sends negints anyway.
-  232|  3.59k|            let neg: i128 = -1 - n as i128;
-  233|  3.59k|            if neg < i64::MIN as i128 {
+  232|  3.68k|            let neg: i128 = -1 - n as i128;
+  233|  3.68k|            if neg < i64::MIN as i128 {
   234|      1|                return None;
-  235|  3.59k|            }
-  236|  3.59k|            Some((serde_json::json!(neg as i64), pos))
+  235|  3.68k|            }
+  236|  3.68k|            Some((serde_json::json!(neg as i64), pos))
   237|       |        }
   238|       |        2 | 3 => {
   239|       |            // checked_add + get: a length past the buffer end is truncation.
   240|       |            // `pos` is buf-space (bytes consumed by the head).
-  241|  16.7k|            let end = pos.checked_add(n as usize)?;
-  242|  16.7k|            let b = buf.get(pos..end)?;
-  243|  16.7k|            if major == 3 {
-  244|  10.5k|                let s = std::str::from_utf8(b).ok()?;
-  245|  10.5k|                Some((serde_json::json!(s), end))
+  241|  20.0k|            let end = pos.checked_add(n as usize)?;
+  242|  20.0k|            let b = buf.get(pos..end)?;
+  243|  20.0k|            if major == 3 {
+  244|  12.8k|                let s = std::str::from_utf8(b).ok()?;
+  245|  12.8k|                Some((serde_json::json!(s), end))
   246|       |            } else {
-  247|  6.20k|                Some((serde_json::json!(hex::encode(b)), end))
+  247|  7.16k|                Some((serde_json::json!(hex::encode(b)), end))
   248|       |            }
   249|       |        }
   250|       |        4 => {
   251|       |            // Children start at buf[pos]; every returned count is in the
   252|       |            // callee's own buffer space, so `at += used` stays buf-space.
-  253|  3.40k|            let mut out = Vec::new();
-  254|  3.40k|            let mut at = pos;
-  255|  3.40k|            for _ in 0..n {
-  256|  16.1k|                let (v, used) = decode_value(&buf[at..], depth + 1)?;
-  257|  15.7k|                if used == 0 {
+  253|  3.34k|            let mut out = Vec::new();
+  254|  3.34k|            let mut at = pos;
+  255|  3.34k|            for _ in 0..n {
+  256|  15.6k|                let (v, used) = decode_value(&buf[at..], depth + 1)?;
+  257|  15.2k|                if used == 0 {
   258|      0|                    return None;
-  259|  15.7k|                }
-  260|  15.7k|                at = at.checked_add(used)?;
-  261|  15.7k|                out.push(v);
+  259|  15.2k|                }
+  260|  15.2k|                at = at.checked_add(used)?;
+  261|  15.2k|                out.push(v);
   262|       |            }
-  263|  3.04k|            Some((serde_json::Value::Array(out), at))
+  263|  2.98k|            Some((serde_json::Value::Array(out), at))
   264|       |        }
   265|       |        5 => {
-  266|  3.85k|            let mut m = serde_json::Map::new();
-  267|  3.85k|            let mut at = pos;
-  268|  3.85k|            for _ in 0..n {
-  269|  17.5k|                let (k, used) = decode_value(&buf[at..], depth + 1)?;
-  270|  16.8k|                if used == 0 {
+  266|  3.84k|            let mut m = serde_json::Map::new();
+  267|  3.84k|            let mut at = pos;
+  268|  3.84k|            for _ in 0..n {
+  269|  20.1k|                let (k, used) = decode_value(&buf[at..], depth + 1)?;
+  270|  19.4k|                if used == 0 {
   271|      0|                    return None;
-  272|  16.8k|                }
-  273|  16.8k|                at = at.checked_add(used)?;
-  274|  16.8k|                let (v, used) = decode_value(&buf[at..], depth + 1)?;
-  275|  16.7k|                if used == 0 {
+  272|  19.4k|                }
+  273|  19.4k|                at = at.checked_add(used)?;
+  274|  19.4k|                let (v, used) = decode_value(&buf[at..], depth + 1)?;
+  275|  19.3k|                if used == 0 {
   276|      0|                    return None;
-  277|  16.7k|                }
-  278|  16.7k|                at = at.checked_add(used)?;
-  279|  16.7k|                if let Some(ks) = k.as_str() {
-  280|  8.68k|                    m.insert(ks.to_string(), v);
-  281|  8.68k|                }
+  277|  19.3k|                }
+  278|  19.3k|                at = at.checked_add(used)?;
+  279|  19.3k|                if let Some(ks) = k.as_str() {
+  280|  10.5k|                    m.insert(ks.to_string(), v);
+  281|  10.5k|                }
   282|       |            }
-  283|  3.04k|            Some((serde_json::Value::Object(m), at))
+  283|  3.00k|            Some((serde_json::Value::Object(m), at))
   284|       |        }
   285|       |        6 | 7 => {
   286|       |            // tags / simple values / bools / null
-  287|  7.32k|            if major == 7 && info == 20 {
-  288|    714|                Some((serde_json::Value::Bool(false), pos))
-  289|  6.61k|            } else if major == 7 && info == 21 {
-  290|  1.33k|                Some((serde_json::Value::Bool(true), pos))
+  287|  7.65k|            if major == 7 && info == 20 {
+  288|    708|                Some((serde_json::Value::Bool(false), pos))
+  289|  6.94k|            } else if major == 7 && info == 21 {
+  290|  1.36k|                Some((serde_json::Value::Bool(true), pos))
   291|       |            } else {
-  292|  5.27k|                Some((serde_json::Value::Null, pos))
+  292|  5.58k|                Some((serde_json::Value::Null, pos))
   293|       |            }
   294|       |        }
   295|      0|        _ => None,
   296|       |    }
-  297|  51.6k|}
+  297|  56.2k|}
 _RNvNtCs2pf7BP1LhnP_10spore_peer3p2p14decode_message:
-  166|    709|pub fn decode_message(buf: &[u8]) -> Option<Rpc2Message> {
-  167|    709|    let (head_v, used) = decode_value(buf, 0)?;
-  168|    502|    let obj = head_v.as_object()?;
+  166|    718|pub fn decode_message(buf: &[u8]) -> Option<Rpc2Message> {
+  167|    718|    let (head_v, used) = decode_value(buf, 0)?;
+  168|    503|    let obj = head_v.as_object()?;
   169|    485|    let method = obj
   170|    485|        .get("M")
   171|    485|        .and_then(|v| v.as_str())
@@ -447,21 +447,21 @@ _RNvNtCs2pf7BP1LhnP_10spore_peer3p2p14decode_message:
   178|    485|        .unwrap_or("")
   179|    485|        .to_string();
   180|    485|    let payload = if buf.len() > used {
-  181|    360|        let (v, used2) = decode_value(&buf[used..], 0)?;
-  182|    218|        if used2 == 0 {
+  181|    357|        let (v, used2) = decode_value(&buf[used..], 0)?;
+  182|    212|        if used2 == 0 {
   183|      0|            return None; // a zero-consumption decode is malformed by definition
-  184|    218|        }
-  185|    218|        v
+  184|    212|        }
+  185|    212|        v
   186|       |    } else {
-  187|    125|        serde_json::Value::Null
+  187|    128|        serde_json::Value::Null
   188|       |    };
-  189|    343|    Some(Rpc2Message {
-  190|    343|        method,
-  191|    343|        seq,
-  192|    343|        error,
-  193|    343|        payload,
-  194|    343|    })
-  195|    709|}
+  189|    340|    Some(Rpc2Message {
+  190|    340|        method,
+  191|    340|        seq,
+  192|    340|        error,
+  193|    340|        payload,
+  194|    340|    })
+  195|    718|}
 _RNCNvNtCs2pf7BP1LhnP_10spore_peer3p2p14decode_message0B5_:
   171|      9|        .and_then(|v| v.as_str())
 _RNCNvNtCs2pf7BP1LhnP_10spore_peer3p2p14decode_messages0_0B5_:
